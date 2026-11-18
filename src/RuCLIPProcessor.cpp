@@ -1,47 +1,72 @@
 #include "RuCLIPProcessor.h"
 #include "TextLower.h"
 
-///
-inline torch::Tensor CVMatToTorchTensor(cv::Mat img, const bool perm = true)
-{
-	// from_blob не учитывает шаг (step) Mat'а, поэтому для ROI/подматрицы
-	// (неcontinuous) он прочитал бы неверные строки. Делаем непрерывную копию.
-	if (!img.isContinuous())
-		img = img.clone();
+#include <algorithm>
+#include <cstddef>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
-	// clone() сразу отвязывает тензор от памяти cv::Mat (защита от изменения/освобождения Mat).
-	auto tensor_image = torch::from_blob(img.data, { img.rows, img.cols, img.channels() }, at::kByte).clone();
-	if (perm)
-		tensor_image = tensor_image.permute({ 2,0,1 });
-	tensor_image.unsqueeze_(0);
-	tensor_image = tensor_image.toType(c10::kFloat).div(255);
-	return tensor_image;		//tensor_image.clone();
+namespace
+{
+
+/// cv::Mat (8U, HxWx3, BGR как в cv::imread) -> нормализованный float [C, H, W].
+///
+/// Каналы и mean/std применяются по индексу канала — в точности как раньше
+/// (CVMatToTorchTensor с permute(2,0,1) + Normalize(mean, std)).
+std::vector<float> MatToNormalizedCHW(const cv::Mat& img,
+                                      const std::vector<double>& mean,
+                                      const std::vector<double>& std_)
+{
+	CV_Assert(!img.empty());
+	CV_Assert(img.channels() == 3);
+	CV_Assert(mean.size() == 3 && std_.size() == 3);
+
+	const int H = img.rows;
+	const int W = img.cols;
+	std::vector<float> out(static_cast<size_t>(3) * static_cast<size_t>(H) * static_cast<size_t>(W));
+
+	for (int y = 0; y < H; ++y)
+	{
+		const uchar* row = img.ptr<uchar>(y);
+		for (int x = 0; x < W; ++x)
+		{
+			for (int c = 0; c < 3; ++c)
+			{
+				const float v = static_cast<float>(row[x * 3 + c]) / 255.0f;
+				out[(static_cast<size_t>(c) * H + y) * W + x] =
+					(v - static_cast<float>(mean[c])) / static_cast<float>(std_[c]);
+			}
+		}
+	}
+	return out;
 }
 
-///
-inline cv::Mat TorchTensorToCVMat(const torch::Tensor tensor_image, const bool perm = true)
+/// Слияние батчей B=1 в один батч B=N.
+ruclip::TextBatch MergeTextBatches(const std::vector<ruclip::TextBatch>& singles)
 {
-	auto t = tensor_image.detach().to(torch::kCPU);
-	// Ранее squeeze() без аргумента убирал ВСЕ размерности 1 (ломая [1,1,H,W] и батчи).
-	if (t.dim() == 4 && t.size(0) == 1)
-		t = t.squeeze(0);					// убрать только batch=1 -> [C,H,W]
-	if (perm && t.dim() == 3)
-		t = t.permute({ 1, 2, 0 });			// CHW -> HWC
-	t = t.mul(255).clamp(0, 255).to(torch::kU8);
-	t = t.contiguous();
+	ruclip::TextBatch out;
+	out.B = static_cast<int>(singles.size());
+	if (singles.empty())
+		return out;
 
-	TORCH_CHECK(t.dim() == 2 || t.dim() == 3, "TorchTensorToCVMat: expected HW or HWC tensor");
-	const int rows = static_cast<int>(t.size(0));
-	const int cols = static_cast<int>(t.size(1));
-	const int channels = (t.dim() == 3) ? static_cast<int>(t.size(2)) : 1;
-
-	cv::Mat result_img;
-	cv::Mat(rows, cols, CV_MAKETYPE(CV_8U, channels), t.data_ptr()).copyTo(result_img);
-	return result_img;
+	out.L = singles.front().L;
+	out.ids.reserve(static_cast<size_t>(out.B) * static_cast<size_t>(out.L));
+	out.eos_pos.reserve(singles.size());
+	for (const auto& s : singles)
+	{
+		if (s.L != out.L)
+			throw std::runtime_error("MergeTextBatches: inconsistent sequence length");
+		out.ids.insert(out.ids.end(), s.ids.begin(), s.ids.end());
+		out.eos_pos.push_back(s.eos_pos.empty() ? 0 : s.eos_pos.front());
+	}
+	return out;
 }
 
+} // namespace
+
 ///
-RuCLIPProcessor :: RuCLIPProcessor(
+RuCLIPProcessor::RuCLIPProcessor(
 	const std::string& tokenizer_path,
 	const int image_size /*= 224*/,
 	const int text_seq_length /*= 77*/,
@@ -55,7 +80,7 @@ RuCLIPProcessor :: RuCLIPProcessor(
 }
 
 ///!!!Локали-юникоды
-torch::Tensor RuCLIPProcessor :: EncodeText(const/*std::vector<*/std::string &text) const
+ruclip::TextBatch RuCLIPProcessor::EncodeText(const std::string& text) const
 {
 	std::vector<std::vector<int32_t>> ret_ids;
 	vkcom::Status status;
@@ -63,25 +88,71 @@ torch::Tensor RuCLIPProcessor :: EncodeText(const/*std::vector<*/std::string &te
 	// Токенизатор YouTokenToMe регистр сам не понижает, поэтому делаем это здесь.
 	const std::string lowered = ToLowerUtf8(text);
 	//output_type = vkcom::OutputType::ID, bos = false, eos = false, reverse = false, dropout_prob = 0.0
-	std::vector <std::string> texts{ lowered };
+	std::vector<std::string> texts{ lowered };
 	status = Tokenizer->encode_as_ids(texts, &ret_ids);
 	if (status.code != 0)
 		throw std::runtime_error("RuCLIPProcessor::EncodeText error : " + status.message);
-	auto it = ret_ids[0];
-	//for (auto &it : ret_ids)
-	//{
-	if (it.size() > TextSeqLength - 2)
+
+	std::vector<int32_t> it = ret_ids[0];
+	if (it.size() > static_cast<size_t>(TextSeqLength - 2))
 		it.resize(TextSeqLength - 2);
-	it.insert(it.begin(), bos_id);			//vector сдвинет при вставке
-	it.push_back(eos_id);
-	//}
-	return PrepareTokens(it);
+	it.insert(it.begin(), static_cast<int32_t>(bos_id));	// vector сдвинет при вставке
+	it.push_back(static_cast<int32_t>(eos_id));
+
+	return PrepareTokens(std::move(it));
+}
+
+///
+ruclip::TextBatch RuCLIPProcessor::PrepareTokens(std::vector<int32_t> tokens) const
+{
+	// Приводим длину ровно к TextSeqLength, как в оригинальном ru-clip:
+	//  - короче  -> дополняем pad_id (0);
+	//  - длиннее -> обрезаем, сохраняя последний токен (обычно eos).
+	const int empty_positions = TextSeqLength - static_cast<int>(tokens.size());
+	if (empty_positions > 0)
+	{
+		tokens.resize(TextSeqLength, static_cast<int32_t>(pad_id));
+	}
+	else if (empty_positions < 0)
+	{
+		const int32_t back = tokens.back();
+		tokens.resize(TextSeqLength);
+		tokens.back() = back;
+	}
+
+	ruclip::TextBatch batch;
+	batch.B = 1;
+	batch.L = TextSeqLength;
+	batch.ids = std::move(tokens);
+
+	// Позиция EOS: первое вхождение eos_id (в EncodeText он вставляется один раз).
+	int32_t eosPos = static_cast<int32_t>(batch.ids.size()) - 1;
+	for (size_t i = 0; i < batch.ids.size(); ++i)
+	{
+		if (batch.ids[i] == static_cast<int32_t>(eos_id))
+		{
+			eosPos = static_cast<int32_t>(i);
+			break;
+		}
+	}
+	batch.eos_pos.push_back(eosPos);
+	return batch;
+}
+
+///
+ruclip::TextBatch RuCLIPProcessor::PrepareTexts(const std::vector<std::string>& texts) const
+{
+	std::vector<ruclip::TextBatch> singles;
+	singles.reserve(texts.size());
+	for (const auto& t : texts)
+		singles.push_back(EncodeText(t));
+	return MergeTextBatches(singles);
 }
 
 ///
 cv::Mat RuCLIPProcessor::ResizeToInput(const cv::Mat& img) const
 {
-	TORCH_CHECK(!img.empty(), "ResizeToInput: empty image");
+	CV_Assert(!img.empty());
 
 	cv::Mat newImg(cv::Size(ImageSize, ImageSize), img.type(), cv::Scalar(0, 0, 0));
 
@@ -113,102 +184,84 @@ cv::Mat RuCLIPProcessor::ResizeToInput(const cv::Mat& img) const
 	// Заменяем assert (который исчезает под NDEBUG) на проверки, активные
 	// в любой конфигурации сборки: нарушение инварианта не должно проходить
 	// незамеченным в Release.
-	TORCH_CHECK((ImageSize - newWidth) % 2 == 0 && (ImageSize - newHeight) % 2 == 0,
-		"ResizeToInput: padding parity check failed");
+	CV_Assert((ImageSize - newWidth) % 2 == 0 && (ImageSize - newHeight) % 2 == 0);
 
 	const int xOffset = (ImageSize - newWidth) / 2;
 	const int yOffset = (ImageSize - newHeight) / 2;
 
-	TORCH_CHECK(2 * xOffset + newWidth == ImageSize &&
-	            2 * yOffset + newHeight == ImageSize,
-		"ResizeToInput: centered-padding invariant failed");
+	CV_Assert(2 * xOffset + newWidth == ImageSize &&
+	          2 * yOffset + newHeight == ImageSize);
 
 	cv::resize(img, newImg(cv::Rect(xOffset, yOffset, newWidth, newHeight)), cv::Size(newWidth, newHeight), 0, 0, cv::INTER_CUBIC);
 	return newImg;
 }
 
 ///
-torch::Tensor RuCLIPProcessor::EncodeImage(const cv::Mat& img) const
+ruclip::ImageBatch RuCLIPProcessor::EncodeImage(const cv::Mat& img) const
 {
-	torch::Tensor img_tensor = CVMatToTorchTensor(ResizeToInput(img), true);
-	img_tensor = torch::data::transforms::Normalize<>(NormMean, NormStd)(img_tensor);
-	return img_tensor;
+	const cv::Mat resized = ResizeToInput(img);
+
+	ruclip::ImageBatch batch;
+	batch.B = 1;
+	batch.C = resized.channels();
+	batch.H = resized.rows;
+	batch.W = resized.cols;
+	batch.pixels = MatToNormalizedCHW(resized, NormMean, NormStd);
+	return batch;
 }
 
 ///
-torch::Tensor RuCLIPProcessor::PrepareTokens(/*std::vector<*/std::vector<int32_t> tokens) const //Передаю по значению чтобы внутри иметь дело с копией
+ruclip::ImageBatch RuCLIPProcessor::PrepareImages(const std::vector<cv::Mat>& images) const
 {
-	// Приводим длину ровно к TextSeqLength, как в оригинальном ru-clip:
-	//  - короче  -> дополняем pad_id (0);
-	//  - длиннее -> обрезаем, сохраняя последний токен (обычно eos).
-	int empty_positions = TextSeqLength - static_cast<int>(tokens.size());
-	if (empty_positions > 0)
-	{
-		tokens.resize(TextSeqLength, static_cast<int32_t>(pad_id));
-	}
-	else if (empty_positions < 0)
-	{
-		int32_t back = tokens.back();
-		tokens.resize(TextSeqLength);
-		tokens.back() = back;
-	}
+	std::vector<ruclip::ImageBatch> singles;
+	singles.reserve(images.size());
+	for (const auto& img : images)
+		singles.push_back(EncodeImage(img));
 
-	// После нормализации длина всегда ровно TextSeqLength, поэтому тензор
-	// определён во всех случаях. Раньше при empty_positions == 0 (текст ровно
-	// в 77 токенов, т.е. от ~75 BPE-токенов) возвращался неопределённый Tensor.
-	return torch::tensor(tokens, torch::kLong);
+	ruclip::ImageBatch out;
+	out.B = static_cast<int>(singles.size());
+	if (singles.empty())
+		return out;
+
+	out.C = singles.front().C;
+	out.H = singles.front().H;
+	out.W = singles.front().W;
+
+	const size_t one = static_cast<size_t>(out.C) * static_cast<size_t>(out.H) * static_cast<size_t>(out.W);
+	out.pixels.reserve(static_cast<size_t>(out.B) * one);
+	for (const auto& s : singles)
+	{
+		if (s.C != out.C || s.H != out.H || s.W != out.W)
+			throw std::runtime_error("PrepareImages: inconsistent image sizes");
+		out.pixels.insert(out.pixels.end(), s.pixels.begin(), s.pixels.end());
+	}
+	return out;
 }
 
 ///
-void RuCLIPProcessor::CacheText(const std::vector <std::string>& texts)
+void RuCLIPProcessor::CacheText(const std::vector<std::string>& texts)
 {
-	m_textsTensors.clear();
-	for (auto& it : texts)
-	{
-		std::string s = it;
-		torch::Tensor text_tensor = EncodeText(s);
-		m_textsTensors.push_back(text_tensor);
-	}
+	m_cachedTexts.clear();
+	for (const auto& t : texts)
+		m_cachedTexts.push_back(EncodeText(t));
 }
 
 ///
-const std::vector<torch::Tensor>& RuCLIPProcessor::GetTextTensors() const
+const std::vector<ruclip::TextBatch>& RuCLIPProcessor::GetCachedTexts() const
 {
-	return m_textsTensors;
+	return m_cachedTexts;
 }
 
 ///
-std::pair<torch::Tensor, torch::Tensor> RuCLIPProcessor::operator()(const std::vector <std::string> &texts, const std::vector <cv::Mat> &images) const
+std::pair<ruclip::TextBatch, ruclip::ImageBatch> RuCLIPProcessor::operator()(
+	const std::vector<std::string>& texts, const std::vector<cv::Mat>& images) const
 {
-	std::vector <torch::Tensor> texts_tensors;
-	for (auto& it : texts)
-	{
-		std::string s = it;
-		torch::Tensor text_tensor = EncodeText(s);
-		texts_tensors.push_back(text_tensor);
-	}
-
-	std::vector <torch::Tensor> images_tensors;
-	for (auto &it : images)
-	{
-		torch::Tensor img_tensor = CVMatToTorchTensor(ResizeToInput(it), true);
-		img_tensor = torch::data::transforms::Normalize<>(NormMean, NormStd)(img_tensor);
-		//img_tensor.clone();
-		images_tensors.push_back(img_tensor);
-	}
-	return std::make_pair(!texts_tensors.empty()?/*torch::pad_sequence*/torch::stack(texts_tensors):torch::Tensor(), torch::pad_sequence(images_tensors).squeeze(0));
+	return { PrepareTexts(texts), PrepareImages(images) };
 }
 
 ///
-std::pair<torch::Tensor, torch::Tensor> RuCLIPProcessor::operator()(const std::vector <cv::Mat>& images) const
+std::pair<ruclip::TextBatch, ruclip::ImageBatch> RuCLIPProcessor::operator()(
+	const std::vector<cv::Mat>& images) const
 {
-	std::vector <torch::Tensor> images_tensors;
-	for (auto& it : images)
-	{
-		torch::Tensor img_tensor = CVMatToTorchTensor(ResizeToInput(it), true);
-		img_tensor = torch::data::transforms::Normalize<>(NormMean, NormStd)(img_tensor);
-		//img_tensor.clone();
-		images_tensors.push_back(img_tensor);
-	}
-	return std::make_pair(torch::stack(m_textsTensors), torch::pad_sequence(images_tensors).squeeze(0));
+	return { MergeTextBatches(m_cachedTexts), PrepareImages(images) };
 }

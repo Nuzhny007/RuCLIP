@@ -1,64 +1,192 @@
-#include "TorchHeader.h"
-
+#include <algorithm>
+#include <chrono>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
-#include <string>
+#include <locale>
+#include <memory>
+#include <numeric>
 #include <regex>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <opencv2/opencv.hpp>
 
-#include "RuCLIP.h"
+#include "Backend/ClipMath.h"
+#include "Backend/IClipBackend.h"
 #include "RuCLIPProcessor.h"
 
+namespace
+{
+
+using Clock = std::chrono::steady_clock;
+
+double Ms(Clock::time_point a, Clock::time_point b)
+{
+	return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+const char* BackendName(ruclip::BackendKind kind)
+{
+	switch (kind)
+	{
+	case ruclip::BackendKind::Torch:    return "torch";
+	case ruclip::BackendKind::TensorRT: return "trt";
+	case ruclip::BackendKind::Dnn:      return "dnn";
+	}
+	return "?";
+}
+
+/// Печать матрицы вероятностей [B, N] (аналог прежнего вывода torch::Tensor).
+void PrintProbs(const char* title, const ruclip::TensorF32& probs)
+{
+	std::cout << title << ":\n";
+	for (int64_t r = 0; r < probs.rows(); ++r)
+	{
+		for (int64_t c = 0; c < probs.cols(); ++c)
+			std::cout << (c ? "  " : "") << probs.At(r, c);
+		std::cout << "\n";
+	}
+	std::cout.flush();
+}
+
+/// Сбор и печать min/avg/max по фазам (в порядке первого добавления).
+class TimingCollector
+{
+public:
+	void Add(const std::string& phase, double ms)
+	{
+		for (auto& p : phases_)
+		{
+			if (p.name == phase)
+			{
+				p.values.push_back(ms);
+				return;
+			}
+		}
+		phases_.push_back({ phase, { ms } });
+	}
+
+	void Print(const char* backend, int repeat, int warmup) const
+	{
+		// classic-locale: setlocale(LC_ALL, "") иначе печатает десятичную запятую,
+		// из-за чего тайминги не парсятся внешними скриптами.
+		std::ostringstream out;
+		out.imbue(std::locale::classic());
+		out << std::fixed << std::setprecision(3);
+		out << "\nTiming (backend=" << backend << ", repeats=" << repeat
+		    << ", warmup=" << warmup << "):\n";
+		for (const auto& p : phases_)
+		{
+			const double mn = *std::min_element(p.values.begin(), p.values.end());
+			const double mx = *std::max_element(p.values.begin(), p.values.end());
+			const double sum = std::accumulate(p.values.begin(), p.values.end(), 0.0);
+			const double avg = sum / static_cast<double>(p.values.size());
+			out << "  " << std::left << std::setw(15) << p.name << std::right
+			    << " min " << std::setw(10) << mn
+			    << "  avg " << std::setw(10) << avg
+			    << "  max " << std::setw(10) << mx << "  ms\n";
+		}
+		std::cout << out.str();
+		std::cout.flush();
+	}
+
+private:
+	struct Phase
+	{
+		std::string name;
+		std::vector<double> values;
+	};
+	std::vector<Phase> phases_;
+};
+
+} // namespace
+
 ///
-bool MatchImageAndText(torch::Device& device, CLIP& clip, RuCLIPProcessor& processor,
+bool MatchImageAndText(ruclip::IClipBackend& backend, const RuCLIPProcessor& processor,
 	const std::vector<cv::Mat>& images, const std::vector<std::string>& labels,
-	bool showResult)
+	bool showResult, int repeat)
 {
 	bool res = false;
 
-	auto dummy_input = processor(labels, images);
-	try {
-		torch::Tensor logits_per_image = clip->forward(dummy_input.first.to(device), dummy_input.second.to(device));
-		torch::Tensor logits_per_text = logits_per_image.t();
-		auto probs = logits_per_image.softmax(/*dim = */-1).detach().cpu();
-		std::cout << "probs per image:\n" << probs << std::endl;
-		
+	try
+	{
+		auto runOnce = [&](ruclip::TensorF32& probs) -> std::vector<std::pair<std::string, double>>
+		{
+			const auto t0 = Clock::now();
+			const auto input = processor(labels, images);
+			const auto t1 = Clock::now();
+			const ruclip::TensorF32 textFeatures = backend.EncodeText(input.first);
+			const auto t2 = Clock::now();
+			const ruclip::TensorF32 imageFeatures = backend.EncodeImage(input.second);
+			const auto t3 = Clock::now();
+			probs = ruclip::ProbsPerImage(imageFeatures, textFeatures, backend.logitScale());
+			const auto t4 = Clock::now();
+
+			const double pre = Ms(t0, t1);
+			const double encT = Ms(t1, t2);
+			const double encI = Ms(t2, t3);
+			const double post = Ms(t3, t4);
+			return {
+				{ "preprocess",   pre },
+				{ "encode_text",  encT },
+				{ "encode_image", encI },
+				{ "postprocess",  post },
+				{ "total",        pre + encT + encI + post },
+			};
+		};
+
+		ruclip::TensorF32 probs;
+		runOnce(probs);	// прогрев (не учитывается в статистике)
+
+		TimingCollector timing;
+		for (int i = 0; i < repeat; ++i)
+		{
+			for (const auto& [name, ms] : runOnce(probs))
+				timing.Add(name, ms);
+		}
+		timing.Print(BackendName(backend.kind()), repeat, 1);
+
+		PrintProbs("probs per image", probs);
+
 		if (showResult)
 		{
 			for (size_t row = 0; row < images.size(); ++row)
 			{
-				std::string wndName = std::to_string(row);
+				const std::string wndName = std::to_string(row);
 
 				float maxProb = 0.f;
 				size_t maxCol = 0;
 				for (size_t col = 0; col < labels.size(); ++col)
 				{
-					float value = probs[row][col].item<float>();
+					const float value = probs.At(static_cast<int64_t>(row), static_cast<int64_t>(col));
 					if (maxProb < value)
 					{
 						maxProb = value;
 						maxCol = col;
 					}
 				}
-				std::string label = labels[maxCol] + ": " + std::to_string(maxProb);
+				const std::string label = labels[maxCol] + ": " + std::to_string(maxProb);
 
+				cv::Mat shown = images[row].clone();	// не мутируем входной вектор кадров
 				int baseLine = 0;
-				double fontScale = (images[row].cols < 1920) ? 0.7 : 2.0;
-				int thickness = (images[row].cols < 1920) ? 1 : 2;
-				int lineType = cv::LINE_AA;
-				int fontFace = cv::FONT_HERSHEY_SCRIPT_COMPLEX;
-				cv::Size labelSize = cv::getTextSize(label, fontFace, fontScale, thickness, &baseLine);
-				cv::putText(images[row], label, cv::Point(2, 2 + labelSize.height), fontFace, fontScale, cv::Scalar(255, 0, 255), thickness, lineType);
+				const double fontScale = (shown.cols < 1920) ? 0.7 : 2.0;
+				const int thickness = (shown.cols < 1920) ? 1 : 2;
+				const int lineType = cv::LINE_AA;
+				const int fontFace = cv::FONT_HERSHEY_SCRIPT_COMPLEX;
+				const cv::Size labelSize = cv::getTextSize(label, fontFace, fontScale, thickness, &baseLine);
+				cv::putText(shown, label, cv::Point(2, 2 + labelSize.height), fontFace, fontScale, cv::Scalar(255, 0, 255), thickness, lineType);
 
-
-				cv::imshow(wndName, images[row]);
+				cv::imshow(wndName, shown);
 				cv::waitKey(1);
 			}
 			cv::waitKey(0);
 		}
-		
+
 		res = true;
 	}
 	catch (std::exception& e)
@@ -70,9 +198,9 @@ bool MatchImageAndText(torch::Device& device, CLIP& clip, RuCLIPProcessor& proce
 }
 
 ///
-bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& processor,
+bool MatchOne2ManyImages(ruclip::IClipBackend& backend, const RuCLIPProcessor& processor,
 	const std::vector<cv::Mat>& images, const std::vector<std::string>& labels,
-	bool showResult)
+	bool showResult, int repeat)
 {
 	bool res = false;
 
@@ -84,44 +212,53 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 
 	try
 	{
-		std::cout << "Create tensor for reference..." << std::endl;
-		torch::Tensor embed = clip->EncodeImage(processor.EncodeImage(images[0]).to(device));
-		embed = embed / embed.norm(2/*L2*/, -1, true);
+		const std::vector<cv::Mat> others(images.begin() + 1, images.end());
 
-		std::cout << "Create tensor for others..." << std::endl;
-		std::vector<torch::Tensor> imgsTensors;
-		imgsTensors.reserve(images.size() - 1);
-		for (size_t i = 1; i < images.size(); ++i)
+		auto runOnce = [&](ruclip::TensorF32& probs) -> std::vector<std::pair<std::string, double>>
 		{
-			imgsTensors.emplace_back(processor.EncodeImage(images[i]));
-		}
-		auto toStack = torch::stack(imgsTensors);
-		auto toSqueeze = toStack.squeeze(1);
-		auto imgsFeatures = clip->EncodeImage(toSqueeze.to(device));
-		imgsFeatures = imgsFeatures / imgsFeatures.norm(2/*L2*/, -1, true);
+			const auto t0 = Clock::now();
+			const ruclip::TensorF32 embed = ruclip::L2NormalizeRows(
+				backend.EncodeImage(processor.EncodeImage(images[0])));
+			const auto t1 = Clock::now();
+			const ruclip::TensorF32 imgsFeatures = ruclip::L2NormalizeRows(
+				backend.EncodeImage(processor.PrepareImages(others)));
+			const auto t2 = Clock::now();
+			const ruclip::TensorF32 textFeatures = ruclip::L2NormalizeRows(
+				backend.EncodeText(processor.PrepareTexts(labels)));
+			const auto t3 = Clock::now();
+			probs = ruclip::Relevancy(embed, imgsFeatures, textFeatures);
+			const auto t4 = Clock::now();
 
-		std::cout << "Create tensor for text..." << std::endl;
-		std::vector<torch::Tensor> textTensors;
-		textTensors.reserve(labels.size());
-		for (auto label : labels)
+			const double ref = Ms(t0, t1);
+			const double oth = Ms(t1, t2);
+			const double txt = Ms(t2, t3);
+			const double rel = Ms(t3, t4);
+			return {
+				{ "reference", ref },
+				{ "others",    oth },
+				{ "text",      txt },
+				{ "relevancy", rel },
+				{ "total",     ref + oth + txt + rel },
+			};
+		};
+
+		ruclip::TensorF32 probs;
+		runOnce(probs);	// прогрев (не учитывается в статистике)
+
+		TimingCollector timing;
+		for (int i = 0; i < repeat; ++i)
 		{
-			textTensors.emplace_back(processor.EncodeText(label));
+			for (const auto& [name, ms] : runOnce(probs))
+				timing.Add(name, ms);
 		}
-		auto textFeatures = clip->EncodeText(torch::stack(textTensors).to(device));
-		textFeatures = textFeatures / textFeatures.norm(2/*L2*/, -1, true);
-
-		std::cout << "Relevancy: reference image vs " << (images.size() - 1)
-		          << " candidate(s), " << labels.size() << " text negatives" << std::endl;
-		// probs: [batch=1, positives=images-1, 2]; для каждого кандидата — пара
-		// (P(positive), P(negative)) против его самого сложного текстового негатива.
-		torch::Tensor probs = Relevancy(embed, imgsFeatures, textFeatures);
-		std::cout << "probs: " << probs.sizes() << std::endl;
+		timing.Print(BackendName(backend.kind()), repeat, 1);
 
 		size_t bestCol = 1;
 		float bestProb = -1.f;
 		for (size_t col = 1; col < images.size(); ++col)
 		{
-			const float prob = probs[0][col - 1][0].item<float>();	// P(positive)
+			const int64_t p = static_cast<int64_t>(col - 1);
+			const float prob = probs.Flat(p * 2);	// P(positive)
 			std::cout << "  image " << col << ": P(image match) = " << prob << std::endl;
 			if (prob > bestProb)
 			{
@@ -133,13 +270,13 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 
 		if (showResult)
 		{
-			const size_t row = 0;	// референс
-			cv::imshow("reference", images[row]);
+			cv::imshow("reference", images[0]);
 			cv::waitKey(1);
 
 			for (size_t col = 1; col < images.size(); ++col)
 			{
-				const float prob = probs[row][col - 1][0].item<float>();
+				const int64_t p = static_cast<int64_t>(col - 1);
+				const float prob = probs.Flat(p * 2);
 				const std::string text = "image " + std::to_string(col) + ": " + std::to_string(prob);
 
 				cv::Mat shown = images[col].clone();	// не изменяем входной вектор кадров
@@ -157,8 +294,7 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 
 			cv::waitKey(0);
 		}
-		
-		
+
 		res = true;
 	}
 	catch (std::exception& e)
@@ -184,16 +320,24 @@ int main(int argc, const char* argv[])
 		"{ clip             |../data/ruclip-vit-large-patch14-336 | Path to RuClip model | }"
 		"{ show             |1                   | Show result | }"
 		"{ preprocess       |letterbox           | Image preprocessing: letterbox (default) or centercrop | }"
+		"{ backend          |torch               | Inference backend: torch (libtorch) | }"
+		"{ max_batch        |8                   | TensorRT: max batch (optimization profile) | }"
+		"{ fp16             |0                   | TensorRT: build FP16 engine | }"
+		"{ repeat           |1                   | Timing: measured iterations (warmup excluded) | }"
 	};
-	
+
 	cv::CommandLineParser parser(argc, argv, keys);
 	parser.printMessage();
 
-	int testInd = parser.get<int>("test_ind"); 
-	std::string imagesStr = parser.get<std::string>("imgs");
-	std::string labelsStr = parser.get<std::string>("text");
-	std::string pathToClip = parser.get<std::string>("clip");
-	bool showResult = parser.get<int>("show") != 0;
+	const int testInd = parser.get<int>("test_ind");
+	const std::string imagesStr = parser.get<std::string>("imgs");
+	const std::string labelsStr = parser.get<std::string>("text");
+	const std::string pathToClip = parser.get<std::string>("clip");
+	const bool showResult = parser.get<int>("show") != 0;
+	const std::string backendStr = parser.get<std::string>("backend");
+	int repeat = parser.get<int>("repeat");
+	if (repeat < 1)
+		repeat = 1;
 
 	std::string preprocessStr = parser.get<std::string>("preprocess");
 	ImagePreprocess preprocess = ImagePreprocess::Letterbox;
@@ -202,24 +346,31 @@ int main(int argc, const char* argv[])
 	else if (preprocessStr != "letterbox")
 		std::cerr << "Unknown --preprocess '" << preprocessStr << "', using letterbox" << std::endl;
 
-	torch::manual_seed(24);
-
-	torch::Device device(torch::kCPU);
-	if (torch::cuda::is_available())
+	ruclip::BackendKind backendKind = ruclip::BackendKind::Torch;
+	if (backendStr == "torch" || backendStr == "libtorch")
+		backendKind = ruclip::BackendKind::Torch;
+	else if (backendStr == "trt" || backendStr == "tensorrt")
+		backendKind = ruclip::BackendKind::TensorRT;
+	else if (backendStr == "dnn" || backendStr == "opencv" || backendStr == "opencv_dnn")
+		backendKind = ruclip::BackendKind::Dnn;
+	else
 	{
-		std::cout << "CUDA is available! Running on GPU." << std::endl;
-		device = torch::Device(torch::kCUDA);
-	} else {
-		std::cout << "CUDA is not available! Running on CPU." << std::endl;
+		std::cerr << "Unknown --backend '" << backendStr << "'" << std::endl;
+		return 1;
 	}
 
-	std::cout << "Load clip from: " << pathToClip << std::endl;
-	CLIP clip(nullptr);
+	std::cout << "Load clip from: " << pathToClip << " (backend: " << backendStr << ")" << std::endl;
+
+	ruclip::BackendConfig backendConfig;
+	backendConfig.modelDir = pathToClip;
+	backendConfig.maxBatch = parser.get<int>("max_batch");
+	backendConfig.useFp16 = parser.get<int>("fp16") != 0;
+
+	std::unique_ptr<ruclip::IClipBackend> backend;
 	RuCLIPProcessor processor;
 	try
 	{
-		clip = FromPretrained(pathToClip);
-		clip->to(device);
+		backend = ruclip::CreateBackend(backendKind, backendConfig);
 
 		std::cout << "Image preprocessing: "
 		          << (preprocess == ImagePreprocess::CenterCrop ? "centercrop" : "letterbox") << std::endl;
@@ -227,7 +378,7 @@ int main(int argc, const char* argv[])
 	}
 	catch (const std::exception& e)
 	{
-		std::cerr << "Failed to load model/processor from '" << pathToClip << "': " << e.what() << std::endl;
+		std::cerr << "Failed to create backend/processor from '" << pathToClip << "': " << e.what() << std::endl;
 		return 1;
 	}
 
@@ -267,16 +418,16 @@ int main(int argc, const char* argv[])
 	switch (testInd)
 	{
 	case 0:
-		MatchImageAndText(device, clip, processor, images, labels, showResult);
+		MatchImageAndText(*backend, processor, images, labels, showResult, repeat);
 		break;
 
 	case 1:
-		MatchOne2ManyImages(device, clip, processor, images, labels, showResult);
+		MatchOne2ManyImages(*backend, processor, images, labels, showResult, repeat);
 		break;
 
 	default:
 		std::cerr << "Wrong test index: " << testInd << std::endl;
 	}
-	
+
 	std::cout << "The end!" << std::endl;
 }

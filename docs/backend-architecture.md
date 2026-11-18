@@ -2,7 +2,7 @@
 
 > Проект: неофициальный C++-порт ruCLIP (Sber AI).
 > Корень: `C:\work\clip\ruclip\RuCLIP`. Сборка: `C:\work\clip\ruclip\rel`.
-> Статус: **проект дизайна** — код ещё не изменён.
+> Статус: **реализовано** (Фазы 0–5). Актуальный обзор и инструкции — в `README.md`.
 
 ---
 
@@ -54,11 +54,14 @@
 ### 3.1 Типы данных (нейтральные)
 
 ```cpp
-// Минимальный CPU-тензор float32. Достаточен для эмбеддингов и логитов.
+// Минимальный CPU-тензор float32 (row-major), общий для всех бэкендов.
+// Форма произвольная: 2D достаточно для эмбеддингов и логитов,
+// а [B, P, 2] требуется для Relevancy.
 struct TensorF32 {
-    std::vector<float> data;   // row-major
-    int rows = 0;
-    int cols = 0;
+    std::vector<float> data;      // row-major
+    std::vector<int64_t> shape;   // произвольная размерность
+    int64_t rows() const;         // shape[0]
+    int64_t cols() const;         // shape[1]
 };
 
 // Токены: [B * L] int32 + позиция EOS для каждой строки.
@@ -226,17 +229,22 @@ ruclip-vit-<variant>/
 
 ### 6.2 Экспорт (одноразовый, Python, офлайн)
 
-Экспорт делается **из оригинальной Python-модели `ruclip`**, а не из C++-порта (C++ не нужен на этом шаге). В репозитории уже есть пример пути — ноутбук `docs\ru-clip-main\jupyters\RuCLIP_onnx_example.ipynb` использует `clip_onnx` (Lednik7/CLIP-ONNX), который уже делит модель на `clip_visual.onnx` и `clip_textual.onnx`.
+Скрипт: [`tools/export_onnx.py`](../tools/export_onnx.py). Экспорт делается **из оригинальной Python-модели `ruclip`**, а не из C++-порта (C++ не нужен на этом шаге). Ноутбук `docs\ru-clip-main\jupyters\RuCLIP_onnx_example.ipynb` (`clip_onnx`, Lednik7/CLIP-ONNX) — альтернативный путь.
 
-Порядок экспорта (скрипт будет добавлен в `tools/export_onnx.py`):
+Порядок экспорта (реализовано):
 
-1. `ruclip.load(name)` → `clip`, `processor`.
-2. `EncodeImage`-подграф: `torch.onnx.export` с `input_names=["pixel_values"]`, `output_names=["image_features"]`, вход `[1,3,H,W]` f32.
-3. `EncodeText`-подграф: `input_names=["input_ids"]`, `output_names=["text_features"]`, вход `[1,77]` **int64→int32 на входе**, выход **полная последовательность** `[1,77,D]` (для этого берём `ln_final`-выход и применяем `text_projection` ко всем позициям, без среза по EOS).
-4. `opset_version`: 13 (компромисс для OpenCV DNN) или 17 (если целимся только на TRT/ORT). Для DNN дополнительно — развёрнутый `LayerNorm` (см. 7.2).
-5. Дописать `logit_scale` (и при необходимости `mean`/`std`) в `config.json`.
+1. Загрузка `ruclip.model.CLIP.from_pretrained(<каталог модели>)` — **без сети**, только локальные `config.json`/`pytorch_model.bin`.
+2. `EncodeImage`-подграф: `input_names=["pixel_values"]`, `output_names=["image_features"]`, вход `[1,3,H,W]` f32.
+3. `EncodeText`-подграф: `input_names=["input_ids"]`, `output_names=["text_features"]`, вход `[1,77]` **int32**, выход **полная последовательность** `[1,77,D]` (`ln_final` → `text_projection` по всем позициям, без среза по EOS).
+4. `opset_version = 14`: `torch>=2.x` экспортирует multi-head attention через `aten::scaled_dot_product_attention`, который поддержан только с opset 14; граф при этом **полностью разложен** на стандартные операции (`MatMul`/`Gemm`, `Softmax`, `ReduceMean`/`Sqrt`/`Pow`/`Div` для LayerNorm, `Sigmoid`+`Mul` для QuickGELU, `Gather`), без слитых `Attention`/`LayerNormalization`.
+5. Динамический batch (ось 0) — для этого в обёртках используются `flatten(2)` и `zeros_like` (иначе batch запекается константой).
+6. Дописать `logit_scale = exp(logit_scale)` в `config.json`.
 
-> `QuickGELU = x·σ(1.702x)` не является стандартным оператором ни в ONNX, ни в TensorRT/OpenCV. Экспортёр сам разложит его в `Sigmoid + Mul` — дополнительных действий не требуется, но в приёмочном тесте стоит явно проверить этот узел графа.
+> **`logit_scale` обучаемый и различается по моделям** — на трёх моделях получено `31.40`, `45.29`, `48.74` (а не стандартные `1/0.07 ≈ 14.29`). Поэтому его обязательно читать из `config.json`, а не хардкодить.
+
+> `QuickGELU = x·σ(1.702x)` не является стандартным оператором ни в ONNX, ни в TensorRT/OpenCV. Экспортёр раскладывает его в `Sigmoid + Mul` (в графе присутствуют оба узла).
+
+Проверка (скрипт делает автоматически, `onnxruntime`): max|diff| PyTorch vs ONNX ≈ `1e-7…1e-5` для batch=1 и batch=3 на всех трёх моделях.
 
 ---
 
@@ -270,39 +278,45 @@ ruclip-vit-<variant>/
 - engine аппаратно-зависим (пересборка под GPU/версию TRT — офлайн-шаг);
 - нет CPU-fallback: на машине без GPU бэкенд недоступен (это не ошибка сборки, а рантайм-ограничение).
 
-**Оценка объёма кода:** `TensorRTBackend` + построение engine ≈ 300–500 строк, плюс RAII-обёртки над `nvinfer1`/`cuda` (деструкторы, `unique_ptr`-кастом-делетеры).
+**Реализация (Фаза 3):** `src/Backend/TensorRTBackend.cpp` (~400 строк).
+
+- Окружение машины: **TensorRT 10.16.1.11**, **CUDA 13.2**, драйвер 621, RTX 4070 (sm89), OpenCV 4.14.
+- Движки собираются из ONNX при первом запуске и кэшируются в `<model>/engines/`
+  (`clip_visual.engine` + `clip_textual.engine`; для large-336 ≈ 1.2 ГБ + 0.5 ГБ).
+- CMake: `RUCLIP_WITH_TRT=ON`, `RUCLIP_TRT_ROOT` (автоопределение `C:/work/libraries/cuda/TensorRT-*`), `find_package(CUDAToolkit)`.
+- Особенности TRT 10.16: интерфейсы освобождаются через `delete` (`destroy()` удалён), у `IOptimizationProfile` protected-деструктор (владение забирает `addOptimizationProfile`).
+- Совместимость с torch (cu126): torch ожидает `CUDA::nvToolsExt`, которого нет в CUDA 13 — в CMake добавляется пустая INTERFACE-цель.
+- TF32 в TRT включён по умолчанию: расхождение с torch ≈ 5e-4 (для строгого FP32 — `config->clearFlag(BuilderFlag::kTF32)`).
+
+**Проверено:**
+- `--backend=trt` (large-336): `0.8171 / 0.00347 / 0.1794 …` против torch `0.8166 / 0.00347 / 0.1799 …`;
+- `Relevancy` (test_ind=1) совпадает с torch до ~5e-5;
+- мультибэкендная сборка (torch + TRT в одном exe) собирается, и оба `--backend=torch|trt` работают.
 
 ---
 
-### 7.2 DnnBackend ⚠️ (реализуемо, но самый хрупкий)
+### 7.2 DnnBackend ✅ (реализовано на OpenCV 5.1.0)
 
-**Путь данных:** `cv::dnn::readNetFromONNX` → `net.setInput` → `net.forward`.
+**Путь данных:** `cv::dnn::readNetFromONNX(path, cv::dnn::ENGINE_OPENCV)` → `net.setInput` → `net.forward`.
 
-**Поддержка операторов модели (ключевой риск):**
+**Реализация (Фаза 4):** `src/Backend/DnnBackend.cpp` (~100 строк).
 
-| Операция модели | В OpenCV DNN | Комментарий / обход |
-|---|---|---|
-| `Conv2d`, `Linear`/`MatMul`, `Softmax` | ✅ | стандарт |
-| `QuickGELU` | ✅ | `Sigmoid + Mul` |
-| Self-attention (reshape/transpose) | ⚠️ | паттерн многоголового внимания из PyTorch-экспорта — известное место падений shape-inference |
-| `LayerNorm` | ⚠️ | нативно отсутствовал до поздних 4.x (≈4.9); полная поддержка трансформеров — в OpenCV 5.0 |
-| `Embedding` (int64 `Gather`) | ⚠️ | int32/int64 поддержаны поздно; обход — int32-токены |
-| Динамический `Gather` по EOS | ❌/⚠️ | **исключён из графа** (см. 5.3) |
+- Требует **OpenCV 5.x** (в окружении — 5.1.0, `OPENCV_DNN_CUDA=ON`). Новый graph-движок `ENGINE_OPENCV` разбирает весь ONNX-граф (opset 14, разложенный): 24-слойный ViT и текстовый трансформер с `LayerNorm`, `QuickGELU`, каузальной маской и int32-`Embedding`.
+- `input_ids` подаётся как `cv::Mat` `CV_32S` `[B,77]`; изображения — `cv::Mat` `CV_32F` `[B,3,H,W]`. `setInput` копирует данные, поэтому внешние буферы `ImageBatch`/`TextBatch` можно передавать как non-owning `cv::Mat`.
+- Динамический batch работает (проверено на `B=3`).
+- `readNetFromONNX` — с явным `ENGINE_OPENCV` (не `ENGINE_AUTO`, который может смениться).
+- `logit_scale` — из `config.json`; EOS — общий `GatherEos`.
 
-**Ключевые решения и обходы:**
+**Проверено (large-336, один exe с torch/TRT):**
+- `--backend=dnn`: `0.81661 / 0.00347 / 0.17992 …` против torch `0.816615 / 0.00347 / 0.179912 …` (расхождение ~1e-5);
+- `Relevancy` (test_ind=1): `0.997076 / 0.996927 / 0.997114 / 0.999034 / 0.988056` против torch `0.997069 / …` (~5e-5).
 
-1. **Версия OpenCV.** Текущее требование `find_package(OpenCV 4.6)` (`CMakeLists.txt:10`) **недостаточно**: 4.6 не имеет нативного ONNX `LayerNorm` и стабильного int64-пути. Для DNN-бэкенда нужно ≥ 4.10, а для уверенной работы трансформера — фактически **OpenCV 5.0** (переписанный graph-движок, покрытие ~80% ONNX-операторов). Базовый OpenCV для I/O остаётся 4.6; модуль `dnn` тянет более новая версия.
-2. **`LayerNorm`.** Два варианта:
-   - экспорт ONNX на opset 11–13 с **развёрнутым** `LayerNorm` (`ReduceMean → Sub → Pow → ReduceMean → Sqrt → Div → Mul → Add`);
-   - либо OpenCV с нативным `LayerNorm`.
-   Рекомендация: разворачивать при экспорте — это убирает зависимость от версии OpenCV.
-3. **`Embedding`/int64.** Токены идут int32 (контракт `TextBatch`), поэтому int64-`Gather` не возникает вовсе.
-4. **Динамический EOS-`Gather`.** Полностью вынесен в `GatherEos` (см. 5.3) — самый проблемный динамический оператор исчезает из графа.
-5. **Batch.** `cv::dnn::Net` поддерживает динамику ограниченно; проще фиксировать batch через `net.setInput` (или пересоздавать сеть под нужный `B`).
+**Окружение/запуск:**
+- `find_package(OpenCV REQUIRED)` + проверка `>= 5.0` при `RUCLIP_WITH_DNN=ON`;
+- `opencv_dnn510.dll` собран с CUDA/ONNX Runtime, поэтому в `PATH` нужны `CUDA\v13.2\bin\x64` (cublas/cudart), `cudnn64_9.dll` и `onnxruntime.dll`;
+- готовый скрипт — `rel_all\Release\run_all.bat torch|trt|dnn`.
 
-**Оценка объёма кода:** `DnnBackend` сам по себе мал (~100–150 строк), но **основные затраты — не код, а отладка несовместимости операторов** (подбор способа экспорта/opset/версии OpenCV) и приёмочный тест на паритет.
-
-> 💡 **Если цель DNN — портативный CPU-рантайм без LibTorch**, рекомендую рассмотреть **ONNX Runtime** как альтернативу внутри того же интерфейса `IClipBackend`: тот же ONNX-файл, но полная поддержка `LayerNorm`/int64/динамических форм без боли OpenCV DNN. OpenCV DNN оправдан, когда «уже есть OpenCV и добавлять другой рантайм нельзя», либо с OpenCV 5.0.
+> 💡 ONNX Runtime остаётся разумной альтернативой, если нужен CPU-рантайм без тяжёлой сборки OpenCV 5.x, но на практике OpenCV 5.1.0 справился с графом без обходов: разложение `LayerNorm`/`QuickGELU` уже сделано на этапе экспорта (opset 14), int32-токены и вынос EOS-`Gather` — тоже часть контракта.
 
 ---
 
@@ -355,18 +369,31 @@ option(RUCLIP_WITH_DNN   "OpenCV DNN backend" OFF)
 
 Фазы 1 и 2 независимы и могут идти параллельно. Фаза 4 — после 2.
 
+> **Статус:** Фазы 0–5 реализованы — нейтральный слой в `src/Backend/` (`ClipTypes.h`,
+> `ClipMath.*`, `IClipBackend.h`, `BackendFactory.cpp`), `TorchBackend`, `TensorRTBackend`,
+> `DnnBackend`, ключ `--backend`, CMake-опции `RUCLIP_WITH_TORCH/TRT/DNN`. Проект собирается
+> и без LibTorch (`-DRUCLIP_WITH_TORCH=OFF`), и мультибэкендно: один exe с torch + TensorRT +
+> OpenCV DNN, выбор через `--backend=torch|trt|dnn`. ONNX-артефакты (`clip_visual.onnx`,
+> `clip_textual.onnx`) и `logit_scale` в `config.json` получены для трёх моделей скриптом
+> `tools/export_onnx.py` (opset 14, int32-токены, dynamic batch) и проверены `onnxruntime`;
+> TensorRT-engine собираются из ONNX и кэшируются в `engines/`. Паритет бэкендов проверяется
+> скриптом `tools/run_parity.py` (torch/trt/dnn, порог `2e-3`).
+
 ---
 
 ## 11. Приёмка: проверка паритета
 
-1. **Смоук-тест zero-shot** (эталон из `README.md:27-31`): картинки `кот/медведь/лиса` → вероятности
-   `0.8879 / 0.0063 / 0.1058`, `0.0014 / 0.0026 / 0.9960`, `0.0002 / 0.9994 / 0.0003`.
-   Прогон на `torch`, `trt`, `dnn` — результаты должны совпадать в пределах допуска.
-2. **Паритет эмбеддингов**: на фиксированных входных данных сравнить `EncodeImage`/`EncodeText`
-   между бэкендами (косинусная близость > 0.9999 для fp32; отдельный допуск для fp16-TRT).
-3. **Паритет `Relevancy`**: те же случаи форм `[1,·]` и `[B,·]`, `positives.size() ∈ {1, >1}`
-   (roadmap 4.7).
-4. **Сборка**: проверить все комбинации флагов: только Torch, только TRT, только DNN, все три.
+**Автоматически:** [`tools/run_parity.py`](../tools/run_parity.py) прогоняет один exe с
+`--backend=torch|trt|dnn` и сравнивает матрицу zero-shot и значения `Relevancy`
+(эталон — torch, порог `2e-3`, коды возврата 0/1 — пригодно для CI).
+
+Ручные/дополнительные проверки:
+1. **Zero-shot**: у бэкендов совпадают вероятности с точностью до численных эффектов
+   (TF32 в TRT ~5e-4, DNN ~1e-5). Числа `0.8879 / …` — Python-референс (русские метки);
+   C++ их точно не воспроизводит из-за BGR/RGB и letterbox (см. `README.md`).
+2. **`Relevancy`** (`test_ind=1`): формы `[B,·]`, `positives > 1` — паритет проверен.
+3. **Сборка**: все комбинации флагов: только Torch, только TRT, только DNN, torch+TRT, все три.
+4. **Юнит-тест `ClipMath`**: `tests/test_clip_math.cpp` (matmul/norm/softmax/`Relevancy`/`GatherEos`).
 
 ---
 
@@ -386,6 +413,9 @@ option(RUCLIP_WITH_DNN   "OpenCV DNN backend" OFF)
 
 ## 13. Итог
 
-- **TensorRT** — реализуем полностью, путь стандартный (ONNX → engine), риск низкий, максимальный прирост скорости. Рекомендуется первым.
-- **OpenCV DNN** — реализуемо, но требует апгрейда OpenCV (≥4.10, фактически 5.0), разворачивания `LayerNorm`, int32-токенов и выноса динамического EOS-`Gather` из графа. Самый трудоёмкий и рискованный путь; разумная альтернатива для CPU-рантайма — ONNX Runtime.
-- Единый интерфейс `IClipBackend` + общий препроцессинг/постобработка дают и «сборку со всеми бэкендами», и «сборку с одним», без изменения поведения текущей Torch-ветки.
+Реализовано (Фазы 0–5):
+
+- **TensorRT** — `TensorRTBackend`, engine из ONNX (кэш `engines/`), `enqueueV3`, паритет с torch ~5e-4 (TF32).
+- **OpenCV DNN** — `DnnBackend` на OpenCV 5.1.0 (новый движок `ENGINE_OPENCV`), паритет с torch ~1e-5; обошлось без ручного разворачивания операторов — сказалась подготовка экспорта (opset 14, int32, EOS-`Gather` вне графа).
+- Единый интерфейс `IClipBackend` + общий препроцессинг/постобработка дают и «сборку со всеми бэкендами», и «сборку с одним»; поведение Torch-ветки сохранено (паритет со старым бинарником подтверждён).
+- Добавлены `tools/export_onnx.py`, `tools/run_parity.py`, юнит-тест `ClipMath`, скрипты запуска и README.
