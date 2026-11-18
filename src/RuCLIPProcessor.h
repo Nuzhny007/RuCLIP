@@ -20,6 +20,7 @@ enum class ImagePreprocess
 {
 	Letterbox,	// масштаб с сохранением пропорций + чёрные поля (по умолчанию)
 	CenterCrop,	// центральный квадратный кроп + resize (как RandomResizedCrop в Python)
+	Stretch,	// прямая растяжка к квадрату (как в исходном примере README)
 };
 
 /// Процессор ruCLIP: токенизация текста и препроцессинг изображений.

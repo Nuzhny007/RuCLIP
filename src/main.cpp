@@ -3,6 +3,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <locale>
@@ -317,6 +318,7 @@ int main(int argc, const char* argv[])
 		"{ test_ind         |0                   | 0: matching images and text, 1: matching first image with all others (text - negative embeddings) | }"
 		"{ imgs             |img1.jpg,img2.jpg   | List of images | }"
 		"{ text             |cat,bear,fox        | List of labels | }"
+		"{ text_file        |                    | UTF-8 file with labels (one per line); overrides --text | }"
 		"{ clip             |../data/ruclip-vit-large-patch14-336 | Path to RuClip model | }"
 		"{ show             |1                   | Show result | }"
 		"{ preprocess       |letterbox           | Image preprocessing: letterbox (default) or centercrop | }"
@@ -332,6 +334,7 @@ int main(int argc, const char* argv[])
 	const int testInd = parser.get<int>("test_ind");
 	const std::string imagesStr = parser.get<std::string>("imgs");
 	const std::string labelsStr = parser.get<std::string>("text");
+	const std::string textFile = parser.get<std::string>("text_file");
 	const std::string pathToClip = parser.get<std::string>("clip");
 	const bool showResult = parser.get<int>("show") != 0;
 	const std::string backendStr = parser.get<std::string>("backend");
@@ -343,6 +346,8 @@ int main(int argc, const char* argv[])
 	ImagePreprocess preprocess = ImagePreprocess::Letterbox;
 	if (preprocessStr == "centercrop" || preprocessStr == "center-crop" || preprocessStr == "center_crop")
 		preprocess = ImagePreprocess::CenterCrop;
+	else if (preprocessStr == "stretch")
+		preprocess = ImagePreprocess::Stretch;
 	else if (preprocessStr != "letterbox")
 		std::cerr << "Unknown --preprocess '" << preprocessStr << "', using letterbox" << std::endl;
 
@@ -400,6 +405,28 @@ int main(int argc, const char* argv[])
 
 	//Завести метки
 	std::vector<std::string> labels;
+	if (!textFile.empty())
+	{
+		std::ifstream f(textFile);
+		if (!f)
+		{
+			std::cerr << "Cannot open text file: " << textFile << std::endl;
+			return 1;
+		}
+		std::string line;
+		while (std::getline(f, line))
+		{
+			if (!line.empty() && line.back() == '\r')
+				line.pop_back();
+			if (!line.empty())
+				labels.push_back(line);
+		}
+		std::cout << "labels (" << textFile << "): ";
+		for (const auto& l : labels)
+			std::cout << l << " | ";
+		std::cout << std::endl;
+	}
+	else
 	{
 		std::cout << "labels: ";
 		std::regex sep("[,]+");

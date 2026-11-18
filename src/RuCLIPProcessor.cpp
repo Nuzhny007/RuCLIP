@@ -22,13 +22,19 @@ std::vector<float> MatToNormalizedCHW(const cv::Mat& img,
 	CV_Assert(img.channels() == 3);
 	CV_Assert(mean.size() == 3 && std_.size() == 3);
 
+	// cv::imread возвращает BGR, а mean/std модели CLIP заданы в порядке RGB
+	// (OpenCV decodes images to BGR, but the CLIP normalization constants are
+	// RGB-ordered — конвертируем до нормализации).
+	cv::Mat rgb;
+	cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
+
 	const int H = img.rows;
 	const int W = img.cols;
 	std::vector<float> out(static_cast<size_t>(3) * static_cast<size_t>(H) * static_cast<size_t>(W));
 
 	for (int y = 0; y < H; ++y)
 	{
-		const uchar* row = img.ptr<uchar>(y);
+		const uchar* row = rgb.ptr<uchar>(y);
 		for (int x = 0; x < W; ++x)
 		{
 			for (int c = 0; c < 3; ++c)
@@ -155,6 +161,13 @@ cv::Mat RuCLIPProcessor::ResizeToInput(const cv::Mat& img) const
 	CV_Assert(!img.empty());
 
 	cv::Mat newImg(cv::Size(ImageSize, ImageSize), img.type(), cv::Scalar(0, 0, 0));
+
+	if (Preprocess == ImagePreprocess::Stretch)
+	{
+		// Прямая растяжка к квадрату — как в main.cpp оригинального репозитория.
+		cv::resize(img, newImg, cv::Size(ImageSize, ImageSize), 0, 0, cv::INTER_CUBIC);
+		return newImg;
+	}
 
 	if (Preprocess == ImagePreprocess::CenterCrop)
 	{
