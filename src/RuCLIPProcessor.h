@@ -92,7 +92,9 @@ private:
 	cv::Mat ResizeToInput(const cv::Mat& img, bool saveAspectRatio = true) const;
 };
 
-///relevancy for batch size == 1 at this moment,   float lv = result.index({0,0}).item<float>();
+///relevancy: для каждого запроса ищет самый «сложный» негатив.
+/// Вход: embeds [B, D], positives [P, D], negatives [M, D] (L2-нормализованы).
+/// Выход: [B, P, 2] — (P(positive), P(negative)) для каждого позитива.
 ///
 ///std::vector<torch::Tensor> canon_texts_tensors;
 ///canon_texts_tensors.push_back(ClipProcessor->EncodeText(std::string("объект")));
@@ -107,43 +109,38 @@ private:
 ///torch::Tensor image_features = PyramidClipEmbedding.GetPixelValue(i,j,0.5f,img_id,pyramid_embedder_properties,cv::Size(data.W, data.H)).to(torch::kCPU);
 ///image_features = image_features / image_features.norm(2/*L2*/, -1, true);
 ///torch::Tensor rel = Relevancy(image_features, text_features, canon_features);
-///float lv = rel.index({0,0}).item<float>();
+///float lv = rel.index({0,0,0}).item<float>(); // вероятность позитивного класса для 0-го позитива
 
 inline torch::Tensor Relevancy(torch::Tensor embeds, torch::Tensor positives, torch::Tensor negatives)
 {
-#if 0
-	std::cout << "Relevancy: 0" << std::endl;
-	auto embeds2 = torch::cat({ positives, negatives });
-	std::cout << "Relevancy: 1" << std::endl;
-	auto logits = /*scale * */torch::mm(embeds, embeds2.t());  //[batch_size x phrases]
-	std::cout << "Relevancy: 2" << std::endl;
-	auto positive_vals = logits.index({ "...", torch::indexing::Slice(0, positives.sizes()[0]) });  // [batch_size x 1]
-	std::cout << "Relevancy: 3" << std::endl;
-	auto negative_vals = logits.index({ "...", torch::indexing::Slice(positives.sizes()[0], torch::indexing::None) });		// [batch_size x negative_phrase_n]
-	std::cout << "Relevancy: 4" << std::endl;
-	auto repeated_pos = positive_vals.repeat({ 1, negatives.sizes()[0] });  //[batch_size x negative_phrase_n]
-	std::cout << "Relevancy: 5: repeated_pos: " << repeated_pos.sizes() << ", negative_vals: " << negative_vals.sizes() << std::endl;
-	auto sims = torch::stack({ repeated_pos, negative_vals }, -1);   //[batch_size x negative_phrase_n x 2]
-	std::cout << "Relevancy: 6" << std::endl;
-	auto smx = torch::softmax(10 * sims, -1);                      // [batch_size x negative_phrase_n x 2]
-	std::cout << "Relevancy: 7" << std::endl;
-	auto best_id = smx.index({ "...", 0 }).argmin(1);                // [batch_size x 2]
-	std::cout << "Relevancy: 8" << std::endl;
-	auto result = torch::gather(smx, 1, best_id.index({ "...", torch::indexing::None, torch::indexing::None }).expand({ best_id.sizes()[0], negatives.sizes()[0], 2 })
-		).index({ torch::indexing::Slice(), 0, torch::indexing::Slice() });// [batch_size x 2]
-	return result;
-#else
-	auto embeds2 = torch::cat({ positives, negatives }, 0);
-	auto logits = torch::mm(embeds, embeds2.t());  // [batch_size, 1 + negatives_len]
-	auto positive_vals = logits.index({ "...", torch::indexing::Slice(0, 1) });  // [batch_size, 1]
-	auto negative_vals = logits.index({ "...", torch::indexing::Slice(1, torch::indexing::None) });  // [batch_size, negatives_len]
-	auto repeated_pos = positive_vals.repeat({ 1, negatives.sizes()[0] });  // [batch_size, negatives_len]
-	auto sims = torch::stack({ repeated_pos, negative_vals }, -1);  // [batch_size, negatives_len, 2]
-	auto smx = torch::softmax(10 * sims, -1);  // [batch_size, negatives_len, 2]
-	//Находим индекс самого сложного негатива (с минимальной вероятностью позитивного класса)
-	auto best_id = smx.index({ "...", 0 }).argmin(1, /*keepdim=*/true);  // [batch_size, 1]
+	// embeds    : [B, D] — эмбеддинги запроса (должны быть L2-нормализованы)
+	// positives : [P, D] — позитивные эмбеддинги
+	// negatives : [M, D] — негативные эмбеддинги
+	// Результат : [B, P, 2] — для каждого позитива пара (P(positive), P(negative)),
+	//             посчитанная против его самого «сложного» негатива.
+	TORCH_CHECK(embeds.dim() == 2 && positives.dim() == 2 && negatives.dim() == 2,
+		"Relevancy: expected 2D inputs [N, D]");
+	TORCH_CHECK(positives.size(0) >= 1, "Relevancy: at least one positive is required");
+	TORCH_CHECK(negatives.size(0) >= 1, "Relevancy: at least one negative is required");
+
+	const int64_t positives_len = positives.size(0);
+	const int64_t negatives_len = negatives.size(0);
+
+	auto embeds2 = torch::cat({ positives, negatives }, 0);					// [P + M, D]
+	auto logits = torch::mm(embeds, embeds2.t());							// [B, P + M]
+	auto positive_vals = logits.narrow(1, 0, positives_len);				// [B, P]
+	auto negative_vals = logits.narrow(1, positives_len, negatives_len);	// [B, M]
+
+	//Пары «каждый позитив x каждый негатив»: [B, P, M, 2]
+	auto sims = torch::stack({
+			positive_vals.unsqueeze(2).expand({ -1, -1, negatives_len }),
+			negative_vals.unsqueeze(1).expand({ -1, positives_len, -1 })
+		}, -1);
+
+	auto smx = torch::softmax(10.0 * sims, -1);								// [B, P, M, 2]
+	//Для каждого позитива находим индекс самого сложного негатива (минимум вероятности позитивного класса)
+	auto best_id = smx.index({ "...", 0 }).argmin(2, /*keepdim=*/true);	// [B, P, 1]
 	//Собираем результаты для выбранных негативов
-	auto result = torch::gather(smx, 1, best_id.unsqueeze(-1).expand({ -1, -1, 2 }));
-	return result.squeeze(1);  // [batch_size, 2]
-#endif
+	auto result = torch::gather(smx, 2, best_id.unsqueeze(-1).expand({ -1, -1, -1, 2 }));	// [B, P, 1, 2]
+	return result.squeeze(2);												// [B, P, 2]
 }

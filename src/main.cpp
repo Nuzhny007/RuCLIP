@@ -132,7 +132,8 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 
 			for (size_t col = 1; col < images.size(); ++col)
 			{
-				float prob = probs[row][col - 1].item<float>();
+				// probs имеет форму [batch, positives, 2] — берём вероятность позитивного класса
+				float prob = probs[row][col - 1][0].item<float>();
 				std::string label = std::to_string(col) + ": " + std::to_string(prob);
 
 				int baseLine = 0;
