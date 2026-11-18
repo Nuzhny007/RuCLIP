@@ -6,14 +6,11 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/src/youtokentome)
 include_directories(${CMAKE_SOURCE_DIR}/src/youtokentome/third_party)
 
-link_directories(
-	"C:/Program Files (x86)/Intel/oneAPI/mkl/2022.1.0/lib/intel64"
-)
+# Intel MKL приходит вместе с LibTorch; отдельный link_directories не нужен.
 
 set(SOURCES ${SOURCES}
 	src/RuCLIP.cpp
 	src/RuCLIPProcessor.cpp
-	#src/RuCLIPPredictor.cpp
 	src/youtokentome/utf8.cpp
 	src/youtokentome/utils.cpp
 	src/youtokentome/bpe.cpp
@@ -29,7 +26,7 @@ set(HEADERS ${HEADERS}
 	src/youtokentome/utils.h
 	src/youtokentome/bpe.h
 	src/RuCLIPProcessor.h
-	#src/RuCLIPPredictor.h
+	src/TextLower.h
 )
 
 set(LIBS ${LIBS}

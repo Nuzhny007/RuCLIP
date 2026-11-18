@@ -1,5 +1,7 @@
 #include "RuCLIP.h"
 
+#include <limits>
+
 ResidualAttentionBlockImpl :: ResidualAttentionBlockImpl(const std::string &module_name, const int d_model, const int n_head, const torch::Tensor &attn_mask)
 	: torch::nn::Module(module_name)
 {
@@ -17,7 +19,6 @@ ResidualAttentionBlockImpl :: ResidualAttentionBlockImpl(const std::string &modu
 	register_module("ln_1", Ln1);
 	register_module("mlp", Mlp);
 	register_module("ln_2", Ln2);
-	//register_buffer("attn_mask", AttnMask);
 }
 
 torch::Tensor ResidualAttentionBlockImpl :: Attention(const torch::Tensor &x)
@@ -98,9 +99,10 @@ VisionTransformerImpl :: VisionTransformerImpl(
 	LnPost = RCLayerNorm(std::vector<int64_t>() = { (int64_t)width });
 	Proj = scale * torch::randn({ width, output_dim });
 
-	register_buffer("class_embedding", ClassEmbedding);
-	register_buffer("positional_embedding", PositionalEmbedding);
-	register_buffer("proj", Proj);
+	// Как nn.Parameter в Python: это параметры, а не буферы.
+	register_parameter("class_embedding", ClassEmbedding);
+	register_parameter("positional_embedding", PositionalEmbedding);
+	register_parameter("proj", Proj);
 	register_module("conv1", Conv1);
 	register_module("ln_pre", LnPre);
 	register_module("ln_post", LnPost);
@@ -151,9 +153,7 @@ CLIPImpl :: CLIPImpl(
 
 	TokenEmbedding = torch::nn::Embedding(vocab_size, transformer_width);
 	PositionalEmbedding = torch::empty({ context_length, transformer_width });	//!!!type, device
-	
-	std::cout << "transformer_width: " << transformer_width<< std::endl;
-	
+
 	LnFinal = RCLayerNorm(std::vector<int64_t>() = { (int64_t)transformer_width });
 	TextProjection = torch::empty({ transformer_width, embed_dim });	//!!!type, device
 	LogitScale = torch::ones({}) * logf(1.f / 0.07f);
@@ -162,9 +162,10 @@ CLIPImpl :: CLIPImpl(
 	register_module("transformer", NVTransformer);
 	register_module("token_embedding", TokenEmbedding);
 	register_module("ln_final", LnFinal);
-	register_buffer("positional_embedding", PositionalEmbedding);
-	register_buffer("text_projection", TextProjection);
-	register_buffer("logit_scale", LogitScale);
+	// Как nn.Parameter в Python: это параметры, а не буферы.
+	register_parameter("positional_embedding", PositionalEmbedding);
+	register_parameter("text_projection", TextProjection);
+	register_parameter("logit_scale", LogitScale);
 
 	InitializeParameters();
 }
@@ -189,30 +190,36 @@ torch::Tensor CLIPImpl :: BuildAttentionMask()
 ///pixel_values : torch::Tensor	Processed images from RuCLIPProcessor class, out: image_latents : torch::Tensor Image embeddings
 torch::Tensor CLIPImpl :: EncodeImage(torch::Tensor pixel_values)
 {
+	torch::NoGradGuard no_grad;	// инференс: как torch.no_grad() в Python
 	return Visual(pixel_values);
 }
 
 ///input_ids : torch::Tensor Tokenized texts from RuCLIPProcessor class, out: text_latents : torch::Tensor Text embeddings
 torch::Tensor CLIPImpl :: EncodeText(torch::Tensor input_ids)
 {
+	torch::NoGradGuard no_grad;	// инференс: как torch.no_grad() в Python
 	auto x = TokenEmbedding(input_ids);	//.type(dtype())  // [batch_size, n_ctx, d_model]
 	x = x + PositionalEmbedding;				//.type(dtype())
 	x = x.permute({ 1, 0, 2 });					//NLD->LND
 	x = NVTransformer(x);
 	x = x.permute({ 1, 0, 2 });					//LND->NLD
 	x = LnFinal(x);											// type(self.dtype) //x.shape = [batch_size, n_ctx, transformer.width]
-	x = torch::mm(x.index({ torch::arange(x.sizes()[0]), torch::where(input_ids == EosId)[1] }), TextProjection);
+	// Позиция eos в каждой строке. torch::where(...)[1] ломался, если eos в строке
+	// не один; маска + argmax даёт первое вхождение eos для каждой строки.
+	auto eos_mask = (input_ids == EosId);
+	TORCH_CHECK(eos_mask.any(/*dim=*/1).all().item<bool>(),
+		"CLIP::EncodeText: every sequence must contain eos_id");
+	auto eos_positions = eos_mask.to(torch::kLong).argmax(/*dim=*/1);	// [batch]
+	x = torch::mm(x.index({ torch::arange(x.sizes()[0]), eos_positions }), TextProjection);
 	return x;
 }
 
 torch::Tensor CLIPImpl :: forward(torch::Tensor input_ids, torch::Tensor pixel_values)
 {
-	std::cout << "pixel_values: " << pixel_values.sizes() << ", input_ids: " << input_ids.sizes() << std::endl;
+	torch::NoGradGuard no_grad;	// инференс: как torch.no_grad() в Python
 
 	auto image_features = EncodeImage(pixel_values);
 	auto text_features = EncodeText(input_ids);
-
-	std::cout << "image_features: " << image_features.sizes() << ", text_features: " << text_features.sizes() << std::endl;
 
 	//normalize features
 	image_features = image_features / image_features.norm(2/*L2*/, -1, true);

@@ -3,6 +3,8 @@
 #include "json.hpp"
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <stdexcept>
 
 #include "TorchHeader.h"
 
@@ -138,11 +140,6 @@ public:
 	void InitializeParameters();
 	torch::Tensor BuildAttentionMask();
 
-	//auto dtype()
-	//{
-	//	return Visual.conv1.weight.dtype();
-	//}
-	
 	///pixel_values : torch::Tensor	Processed images from RuCLIPProcessor class, out: image_latents : torch::Tensor Image embeddings
 	torch::Tensor EncodeImage(torch::Tensor pixel_values);
 
@@ -159,7 +156,6 @@ inline CLIP FromPretrained(const std::filesystem::path &folder)
 {
 	using json = nlohmann::json;
 	std::filesystem::path path = folder / "config.json";
-	std::cout << path << std::endl;
 	std::ifstream f(path);
 	json config = json::parse(f);
 
@@ -176,18 +172,17 @@ inline CLIP FromPretrained(const std::filesystem::path &folder)
 		             int(config["transformer_heads"]),
 		             int(config["transformer_layers"]));
 
-	//for (auto &k : clip->named_parameters())
-	//	std::cout << k.key() << std::endl;
-	//std::cout << "Model params count: " << Trainable::ParamsCount(clip) << std::endl;
-
-	// Загрузка состояния модели из файла
+	// Загрузка состояния модели из файла.
+	// Ошибку не проглатываем: иначе модель молча осталась бы со случайными весами.
+	const std::string weights_path = (folder / "jit_model.zip").string();
 	try
 	{
-		torch::load(clip, (folder / "jit_model.zip").string());
+		torch::load(clip, weights_path);
 	}
-	catch (std::exception& e)
+	catch (const std::exception& e)
 	{
-		std::cout << e.what() << std::endl;
+		throw std::runtime_error("CLIP::FromPretrained: failed to load weights from '" +
+		                         weights_path + "': " + e.what());
 	}
 
 	return clip;

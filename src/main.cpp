@@ -87,7 +87,6 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 		std::cout << "Create tensor for reference..." << std::endl;
 		torch::Tensor embed = clip->EncodeImage(processor.EncodeImage(images[0]).to(device));
 		embed = embed / embed.norm(2/*L2*/, -1, true);
-		std::cout << "embed: " << embed.sizes() << std::endl;
 
 		std::cout << "Create tensor for others..." << std::endl;
 		std::vector<torch::Tensor> imgsTensors;
@@ -95,15 +94,11 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 		for (size_t i = 1; i < images.size(); ++i)
 		{
 			imgsTensors.emplace_back(processor.EncodeImage(images[i]));
-			std::cout << "imgsTensors: " << imgsTensors.back().sizes() << std::endl;
 		}
 		auto toStack = torch::stack(imgsTensors);
-		std::cout << "toStack: " << toStack.sizes() << std::endl;
 		auto toSqueeze = toStack.squeeze(1);
-		std::cout << "toSqueeze: " << toSqueeze.sizes() << std::endl;
 		auto imgsFeatures = clip->EncodeImage(toSqueeze.to(device));
 		imgsFeatures = imgsFeatures / imgsFeatures.norm(2/*L2*/, -1, true);
-		std::cout << "imgsFeatures: " << imgsFeatures.sizes() << std::endl;
 
 		std::cout << "Create tensor for text..." << std::endl;
 		std::vector<torch::Tensor> textTensors;
@@ -114,8 +109,6 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 		}
 		auto textFeatures = clip->EncodeText(torch::stack(textTensors).to(device));
 		textFeatures = textFeatures / textFeatures.norm(2/*L2*/, -1, true);
-
-		std::cout << "embed: " << embed.sizes() << ", imgsFeatures: " << imgsFeatures.sizes() << ", textFeatures: " << textFeatures.sizes() << std::endl;
 
 		std::cout << "Relevancy: reference image vs " << (images.size() - 1)
 		          << " candidate(s), " << labels.size() << " text negatives" << std::endl;
@@ -190,6 +183,7 @@ int main(int argc, const char* argv[])
 		"{ text             |cat,bear,fox        | List of labels | }"
 		"{ clip             |../data/ruclip-vit-large-patch14-336 | Path to RuClip model | }"
 		"{ show             |1                   | Show result | }"
+		"{ preprocess       |letterbox           | Image preprocessing: letterbox (default) or centercrop | }"
 	};
 	
 	cv::CommandLineParser parser(argc, argv, keys);
@@ -200,6 +194,13 @@ int main(int argc, const char* argv[])
 	std::string labelsStr = parser.get<std::string>("text");
 	std::string pathToClip = parser.get<std::string>("clip");
 	bool showResult = parser.get<int>("show") != 0;
+
+	std::string preprocessStr = parser.get<std::string>("preprocess");
+	ImagePreprocess preprocess = ImagePreprocess::Letterbox;
+	if (preprocessStr == "centercrop" || preprocessStr == "center-crop" || preprocessStr == "center_crop")
+		preprocess = ImagePreprocess::CenterCrop;
+	else if (preprocessStr != "letterbox")
+		std::cerr << "Unknown --preprocess '" << preprocessStr << "', using letterbox" << std::endl;
 
 	torch::manual_seed(24);
 
@@ -213,10 +214,22 @@ int main(int argc, const char* argv[])
 	}
 
 	std::cout << "Load clip from: " << pathToClip << std::endl;
-	CLIP clip{ FromPretrained(pathToClip) };
-	clip->to(device);
+	CLIP clip(nullptr);
+	RuCLIPProcessor processor;
+	try
+	{
+		clip = FromPretrained(pathToClip);
+		clip->to(device);
 
-	RuCLIPProcessor processor{ RuCLIPProcessor::FromPretrained(pathToClip) };
+		std::cout << "Image preprocessing: "
+		          << (preprocess == ImagePreprocess::CenterCrop ? "centercrop" : "letterbox") << std::endl;
+		processor = RuCLIPProcessor::FromPretrained(pathToClip, preprocess);
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "Failed to load model/processor from '" << pathToClip << "': " << e.what() << std::endl;
+		return 1;
+	}
 
 	std::vector<cv::Mat> images;
 	{

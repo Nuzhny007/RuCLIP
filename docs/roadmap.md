@@ -144,36 +144,59 @@ float prob = probs[row][col - 1].item<float>();
 ## 2. Расхождения с референсной реализацией Python
 
 ### 2.1 Отсутствует `text.lower()`
-`src/RuCLIPProcessor.cpp:41-62` (строка 47 — закомментированный `//text = lowercase(text);`)
+`src/RuCLIPProcessor.cpp:42-63`, `src/TextLower.h`
+
+> **Статус: ✅ исправлено.** В `EncodeText` добавлен `ToLowerUtf8(text)` перед
+> токенизацией. Помощник (`src/TextLower.h`) понижает регистр ASCII, Latin-1 и
+> кириллицы (А-Я, Ё), а байты, не являющиеся корректным UTF-8, оставляет без
+> изменений. Покрыто юнит-тестом (`КОТ → кот`, `Ёлка → ёлка`, Latin-1, invalid
+> bytes). Кодировка argv на Windows (ANSI → UTF-8) — по-прежнему задача 4.6.
 
 Python (`ruclip/processor.py:32`) приводит текст к нижнему регистру перед токенизацией.
-BPE-токенизатор этого не делает сам. Для заглавных букв C++-порт даст другую
-токенизацию и, как следствие, другие (худшие) эмбеддинги. Нужно добавить корректный
-lowercase с учётом UTF-8/локали (см. 4.6).
+BPE-токенизатор этого не делает сам. Для заглавных букв C++-порт давал другую
+токенизацию и, как следствие, другие (худшие) эмбеддинги.
 
 ### 2.2 Препроцессинг изображений: letterbox вместо center-crop
-`src/RuCLIPProcessor.cpp:65-97`
+`src/RuCLIPProcessor.h`, `src/RuCLIPProcessor.cpp`, `src/main.cpp`
+
+> **Статус: ✅ реализовано (letterbox остаётся по умолчанию).** Добавлен
+> `enum class ImagePreprocess { Letterbox, CenterCrop }` и параметр
+> `--preprocess=letterbox|centercrop`. `CenterCrop` повторяет
+> `RandomResizedCrop(scale=(1,1), ratio=(1,1))` при инференсе: центральный квадрат
+> `min(H, W)` + билинейный resize. Поведение по умолчанию не изменилось.
 
 Python использует `T.RandomResizedCrop(image_size, scale=(1.,1.), ratio=(1.,1.))` —
-центральный квадратный кроп + resize. C++ делает `ResizeToInput` — масштабирование с
-сохранением пропорций и дополнением чёрными полями (letterbox). Это даёт систематическое
-расхождение эмбеддингов с референсом. Рекомендуется реализовать center-crop+resize
-(или хотя бы предоставить переключатель между двумя стратегиями).
+центральный квадратный кроп + resize. C++ по умолчанию делает `ResizeToInput` —
+масштабирование с сохранением пропорций и дополнением чёрными полями (letterbox), что
+даёт систематическое расхождение эмбеддингов с референсом. Теперь стратегию можно
+переключить на Python-совместимый center-crop.
 
 ### 2.3 Параметры зарегистрированы как буферы
-`src/RuCLIP.cpp:101-103` (ViT: `class_embedding`, `positional_embedding`, `proj`) и
-`src/RuCLIP.cpp:165-167` (`positional_embedding`, `text_projection`, `logit_scale`)
+`src/RuCLIP.cpp:102-104, 167-169`
 
-В Python это `nn.Parameter`, в C++ — `register_buffer`. Для инференса и загрузки весов
-по именам это работает, но семантически неверно и хрупко:
-- параметры не участвуют в `named_parameters()`/`requires_grad` (важно при дообучении);
+> **Статус: ✅ исправлено.** Шесть тензоров (`class_embedding`, `positional_embedding`,
+> `proj` в ViT; `positional_embedding`, `text_projection`, `logit_scale` в CLIP) теперь
+> регистрируются через `register_parameter` с теми же именами, т.е. входят в
+> `named_parameters()` и являются grad-tracking параметрами, как `nn.Parameter` в Python.
+> Чтобы инференс оставался без построения графа, `EncodeImage`/`EncodeText`/`forward`
+> обёрнуты в `torch::NoGradGuard` (аналог `torch.no_grad()`).
+
+В Python это `nn.Parameter`, в C++ было — `register_buffer`. Для инференса и загрузки
+весов по именам это работало, но семантически неверно и хрупко:
+- параметры не участвовали в `named_parameters()`/`requires_grad` (важно при дообучении);
 - поведение `.to(dtype)`/`.train()`/`.eval()` для буферов и параметров различается.
 
-Рекомендуется регистрировать их как `register_parameter` (через `torch::nn::Parameter`),
-сохранив те же имена.
-
 ### 2.4 `CVMatToTorchTensor` без проверки непрерывности
-`src/RuCLIPProcessor.cpp:4-12`
+`src/RuCLIPProcessor.cpp:5-17`
+
+> **Статус: ✅ исправлено.** Восстановлена проверка
+> `if (!img.isContinuous()) img = img.clone();` перед `from_blob` (как в базовой версии).
+> Отдельная демонстрация подтвердила: для ROI `isContinuous() == false`, наивное
+> contiguous-чтение даёт неверные данные, а после `clone()` — верные.
+>
+> Замечание: текущие вызовы (`EncodeImage`, `operator()`) передают результат
+> `ResizeToInput`, который всегда возвращает непрерывный `Mat`, поэтому баг был
+> латентным (защита на будущее для прямых вызовов `CVMatToTorchTensor`).
 
 В базовой версии (`ruclip/DeliriumV01D/RuCLIP`) было:
 
@@ -182,16 +205,29 @@ if (!img.isContinuous())
     img = img.clone();
 ```
 
-Сейчас эта проверка убрана. Для непрерывного `cv::Mat` (результат `imread`, `ResizeToInput`)
+Эта проверка была убрана. Для непрерывного `cv::Mat` (результат `imread`, `ResizeToInput`)
 работает, но для ROI/подматрицы `from_blob` прочитает память с неверными шагами →
-мусор/краш. Вернуть проверку (или `img.clone()` перед `from_blob`).
+мусор/краш.
 
 ---
 
 ## 3. Проблемы надёжности и качества кода
 
+> **Статус раздела:** все пункты 3.2–3.10 исправлены. Кратко:
+> 3.2 — добавлены move-конструктор и удалены копии; 3.3 — убран абсолютный путь MKL;
+> 3.4 — `value(...)` с дефолтами mean/std; 3.5 — eos через маску + argmax и проверку;
+> 3.6 — убраны отладочные `std::cout`; 3.7 — добавлены `<limits>`/`<iostream>`;
+> 3.8 — `clone()` после `from_blob`; 3.9 — `squeeze(0)` и проверка каналов;
+> 3.10 — удалён закомментированный код и недопорт `RuCLIPPredictor`.
+
 ### 3.1 `FromPretrained` проглатывает ошибку загрузки весов
-`src/RuCLIP.h:184-191`
+`src/RuCLIP.h:184-197`, `src/main.cpp:223-239`
+
+> **Статус: ✅ исправлено.** `torch::load` больше не проглатывается: ошибка
+> оборачивается в `std::runtime_error` с путём к `jit_model.zip` и пробрасывается наружу.
+> В `main()` загрузка модели и процессора обёрнута в `try/catch`, который печатает
+> понятное сообщение и возвращает код `1`. Проверено на каталоге с одним `config.json`
+> (без `jit_model.zip`): вывод `Failed to load ... failed to load weights ...`, exit code 1.
 
 ```cpp
 try { torch::load(clip, (folder / "jit_model.zip").string()); }
@@ -199,8 +235,7 @@ catch (std::exception& e) { std::cout << e.what() << std::endl; }
 ```
 
 При любой ошибке (нет файла, несовпадение имён, повреждённый архив) модель молча
-остаётся со **случайными** весами. Нужно пробрасывать исключение наружу (`throw`) или
-возвращать статус ошибки, а не продолжать работу.
+оставалась со **случайными** весами.
 
 ### 3.2 Нарушение правила пяти в `RuCLIPProcessor`
 `src/RuCLIPProcessor.h:22,25-41`
@@ -323,12 +358,17 @@ UTF-8 (не `std::tolower` по одному байту). Рассмотреть
 | 1.2 | `PrepareTokens` → undefined при длинных текстах | ✅ Исправлено | `RuCLIPProcessor.cpp:110` |
 | 1.3 | `assert(m_XOffset/...)` несуществующие переменные | ✅ Исправлено | `RuCLIPProcessor.cpp:87` |
 | 1.4 | `MatchOne2ManyImages` OOB/семантика | ✅ Исправлено | `main.cpp:120` |
-| 2.1 | нет `lower()` | Высокий | `RuCLIPProcessor.cpp:41` |
-| 2.2 | letterbox vs center-crop | Высокий | `RuCLIPProcessor.cpp:65` |
-| 2.3 | параметры как буферы | Средний | `RuCLIP.cpp:101,165` |
-| 2.4 | нет `isContinuous()` | Средний | `RuCLIPProcessor.cpp:4` |
-| 3.1 | молчаливый провал загрузки весов | Высокий | `RuCLIP.h:184` |
-| 3.2 | правило пяти | Средний | `RuCLIPProcessor.h:25` |
-| 3.3 | абсолютный путь MKL | Средний | `CMakeLists.Files.txt:9` |
-| 3.4 | нет проверки ключей config | Низкий | `RuCLIPProcessor.h:67` |
-| 3.5–3.10 | индексация eos, debug-вывод, include, clone и т.д. | Низкий/Средний | — |
+| 2.1 | нет `lower()` | ✅ Исправлено | `RuCLIPProcessor.cpp:48` |
+| 2.2 | letterbox vs center-crop | ✅ CenterCrop добавлен | `RuCLIPProcessor.h` |
+| 2.3 | параметры как буферы | ✅ Исправлено | `RuCLIP.cpp:102,167` |
+| 2.4 | нет `isContinuous()` | ✅ Исправлено | `RuCLIPProcessor.cpp:5` |
+| 3.1 | молчаливый провал загрузки весов | ✅ Исправлено | `RuCLIP.h:186` |
+| 3.2 | правило пяти | ✅ Исправлено | `RuCLIPProcessor.h:33` |
+| 3.3 | абсолютный путь MKL | ✅ Исправлено | `CMakeLists.Files.txt` |
+| 3.4 | нет проверки ключей config | ✅ Исправлено | `RuCLIPProcessor.h:77` |
+| 3.5 | хрупкая выборка `eos_id` | ✅ Исправлено | `RuCLIP.cpp:208` |
+| 3.6 | отладочный вывод | ✅ Исправлено | `RuCLIP.cpp`/`main.cpp` |
+| 3.7 | несамодостаточные include | ✅ Исправлено | `RuCLIP.cpp`/`RuCLIP.h` |
+| 3.8 | `from_blob` без `clone()` | ✅ Исправлено | `RuCLIPProcessor.cpp:13` |
+| 3.9 | `TorchTensorToCVMat` squeeze | ✅ Исправлено | `RuCLIPProcessor.cpp:22` |
+| 3.10 | мёртвый код | ✅ Исправлено | `CMakeLists.Files.txt` |

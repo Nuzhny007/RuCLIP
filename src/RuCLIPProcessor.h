@@ -8,6 +8,13 @@
 #include <filesystem>
 #include <fstream>
 
+/// Стратегия приведения изображения к квадрату ImageSize×ImageSize.
+enum class ImagePreprocess
+{
+	Letterbox,	// масштаб с сохранением пропорций + чёрные поля (текущее поведение, по умолчанию)
+	CenterCrop,	// центральный квадратный кроп + resize (как RandomResizedCrop в Python)
+};
+
 ///
 class RuCLIPProcessor
 {
@@ -18,8 +25,13 @@ public:
 		const int image_size = 224,
 		const int text_seq_length = 77,
 		const std::vector<double> norm_mean = { 0.48145466, 0.4578275, 0.40821073 },
-		const std::vector<double> norm_std = { 0.26862954, 0.26130258, 0.27577711 });
+		const std::vector<double> norm_std = { 0.26862954, 0.26130258, 0.27577711 },
+		const ImagePreprocess preprocess = ImagePreprocess::Letterbox);
 	~RuCLIPProcessor() = default;
+
+	RuCLIPProcessor(const RuCLIPProcessor&) = delete;
+	RuCLIPProcessor& operator=(const RuCLIPProcessor&) = delete;
+	RuCLIPProcessor(RuCLIPProcessor&&) = default;
 
 	///
 	RuCLIPProcessor& operator=(RuCLIPProcessor&& processor) noexcept
@@ -32,6 +44,7 @@ public:
 		TextSeqLength = processor.TextSeqLength;
 		NormMean = processor.NormMean;
 		NormStd = processor.NormStd;
+		Preprocess = processor.Preprocess;
 		
 		Tokenizer = std::move(processor.Tokenizer);
 
@@ -56,21 +69,25 @@ public:
 	}
 
 	///
-	static RuCLIPProcessor FromPretrained(const std::filesystem::path &folder)
+	static RuCLIPProcessor FromPretrained(const std::filesystem::path &folder,
+		const ImagePreprocess preprocess = ImagePreprocess::Letterbox)
 	{
 		std::filesystem::path tokenizer_path = folder / "bpe.model";
 		using json = nlohmann::json;
-		std::cout << tokenizer_path << std::endl;
 		std::ifstream f(folder / "config.json");
 		json config = json::parse(f);
 
-		auto mean = config["mean"].template get<std::vector<double>>();
-		auto std = config["std"].template get<std::vector<double>>();
+		// Ключи mean/std могут отсутствовать — используем значения по умолчанию ru-clip.
+		const std::vector<double> default_mean = { 0.48145466, 0.4578275, 0.40821073 };
+		const std::vector<double> default_std  = { 0.26862954, 0.26130258, 0.27577711 };
+		auto mean = config.value("mean", default_mean);
+		auto std  = config.value("std", default_std);
 
 		return RuCLIPProcessor(tokenizer_path.string(),
                                int(config["image_resolution"]),
                                int(config["context_length"]),
-                               mean, std);
+                               mean, std,
+                               preprocess);
 	}
 
 	const std::vector<torch::Tensor>& GetTextTensors() const;
@@ -84,12 +101,13 @@ private:
 	int TextSeqLength{ 77 };
 	std::vector<double> NormMean;
 	std::vector<double> NormStd;
+	ImagePreprocess Preprocess{ ImagePreprocess::Letterbox };
 	std::unique_ptr<vkcom::BaseEncoder> Tokenizer;
 
 	std::vector<torch::Tensor> m_textsTensors;
 
 	///
-	cv::Mat ResizeToInput(const cv::Mat& img, bool saveAspectRatio = true) const;
+	cv::Mat ResizeToInput(const cv::Mat& img) const;
 };
 
 ///relevancy: для каждого запроса ищет самый «сложный» негатив.
