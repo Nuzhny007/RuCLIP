@@ -117,34 +117,48 @@ bool MatchOne2ManyImages(torch::Device& device, CLIP& clip, RuCLIPProcessor& pro
 
 		std::cout << "embed: " << embed.sizes() << ", imgsFeatures: " << imgsFeatures.sizes() << ", textFeatures: " << textFeatures.sizes() << std::endl;
 
-		std::cout << "Relevancy: one image to " << (images.size() - 1) << " with " << labels.size() << " negatives" << std::endl;
+		std::cout << "Relevancy: reference image vs " << (images.size() - 1)
+		          << " candidate(s), " << labels.size() << " text negatives" << std::endl;
+		// probs: [batch=1, positives=images-1, 2]; для каждого кандидата — пара
+		// (P(positive), P(negative)) против его самого сложного текстового негатива.
 		torch::Tensor probs = Relevancy(embed, imgsFeatures, textFeatures);
-		std::cout << "Probs for image2images:\n" << probs << std::endl;
-		
-		
+		std::cout << "probs: " << probs.sizes() << std::endl;
+
+		size_t bestCol = 1;
+		float bestProb = -1.f;
+		for (size_t col = 1; col < images.size(); ++col)
+		{
+			const float prob = probs[0][col - 1][0].item<float>();	// P(positive)
+			std::cout << "  image " << col << ": P(image match) = " << prob << std::endl;
+			if (prob > bestProb)
+			{
+				bestProb = prob;
+				bestCol = col;
+			}
+		}
+		std::cout << "Best match: image " << bestCol << " (P = " << bestProb << ")" << std::endl;
+
 		if (showResult)
 		{
-			size_t row = 0;
-			cv::imshow("source", images[row]);
+			const size_t row = 0;	// референс
+			cv::imshow("reference", images[row]);
 			cv::waitKey(1);
-
-			std::string wndName = std::to_string(row);
 
 			for (size_t col = 1; col < images.size(); ++col)
 			{
-				// probs имеет форму [batch, positives, 2] — берём вероятность позитивного класса
-				float prob = probs[row][col - 1][0].item<float>();
-				std::string label = std::to_string(col) + ": " + std::to_string(prob);
+				const float prob = probs[row][col - 1][0].item<float>();
+				const std::string text = "image " + std::to_string(col) + ": " + std::to_string(prob);
 
+				cv::Mat shown = images[col].clone();	// не изменяем входной вектор кадров
 				int baseLine = 0;
-				double fontScale = (images[col].cols < 1920) ? 0.7 : 2.0;
-				int thickness = (images[col].cols < 1920) ? 1 : 2;
-				int lineType = cv::LINE_AA;
-				int fontFace = cv::FONT_HERSHEY_SCRIPT_COMPLEX;
-				cv::Size labelSize = cv::getTextSize(label, fontFace, fontScale, thickness, &baseLine);
-				cv::putText(images[col], label, cv::Point(2, 2 + labelSize.height), fontFace, fontScale, cv::Scalar(255, 0, 255), thickness, lineType);
+				const double fontScale = (shown.cols < 1920) ? 0.7 : 2.0;
+				const int thickness = (shown.cols < 1920) ? 1 : 2;
+				const int lineType = cv::LINE_AA;
+				const int fontFace = cv::FONT_HERSHEY_SCRIPT_COMPLEX;
+				const cv::Size labelSize = cv::getTextSize(text, fontFace, fontScale, thickness, &baseLine);
+				cv::putText(shown, text, cv::Point(2, 2 + labelSize.height), fontFace, fontScale, cv::Scalar(255, 0, 255), thickness, lineType);
 
-				cv::imshow(wndName, images[col]);
+				cv::imshow(std::to_string(col), shown);	// отдельное окно на каждого кандидата
 				cv::waitKey(1);
 			}
 

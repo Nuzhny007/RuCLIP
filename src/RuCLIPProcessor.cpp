@@ -1,7 +1,5 @@
 #include "RuCLIPProcessor.h"
 
-#include <cassert>
-
 ///
 inline torch::Tensor CVMatToTorchTensor(const cv::Mat img, const bool perm = true)
 {
@@ -80,14 +78,19 @@ cv::Mat RuCLIPProcessor::ResizeToInput(const cv::Mat& img, bool saveAspectRatio)
 			newWidth--;
 		if ((ImageSize - newHeight) % 2)
 			newHeight--;
-		assert((ImageSize - newWidth) % 2 == 0);
-		assert((ImageSize - newHeight) % 2 == 0);
+
+		// Заменяем assert (который исчезает под NDEBUG) на проверки, активные
+		// в любой конфигурации сборки: нарушение инварианта не должно проходить
+		// незамеченным в Release.
+		TORCH_CHECK((ImageSize - newWidth) % 2 == 0 && (ImageSize - newHeight) % 2 == 0,
+			"ResizeToInput: padding parity check failed");
 
 		int xOffset = (ImageSize - newWidth) / 2;
 		int yOffset = (ImageSize - newHeight) / 2;
 
-		assert(2 * xOffset + newWidth == ImageSize);
-		assert(2 * yOffset + newHeight == ImageSize);
+		TORCH_CHECK(2 * xOffset + newWidth == ImageSize &&
+		            2 * yOffset + newHeight == ImageSize,
+			"ResizeToInput: centered-padding invariant failed");
 
 		cv::resize(img, newImg(cv::Rect(xOffset, yOffset, newWidth, newHeight)), cv::Size(newWidth, newHeight), 0, 0, cv::INTER_CUBIC);
 	}
@@ -109,17 +112,25 @@ torch::Tensor RuCLIPProcessor::EncodeImage(const cv::Mat& img) const
 ///
 torch::Tensor RuCLIPProcessor::PrepareTokens(/*std::vector<*/std::vector<int32_t> tokens) const //Передаю по значению чтобы внутри иметь дело с копией
 {
-	torch::Tensor result;
-	if (tokens.size() > TextSeqLength)
+	// Приводим длину ровно к TextSeqLength, как в оригинальном ru-clip:
+	//  - короче  -> дополняем pad_id (0);
+	//  - длиннее -> обрезаем, сохраняя последний токен (обычно eos).
+	int empty_positions = TextSeqLength - static_cast<int>(tokens.size());
+	if (empty_positions > 0)
+	{
+		tokens.resize(TextSeqLength, static_cast<int32_t>(pad_id));
+	}
+	else if (empty_positions < 0)
 	{
 		int32_t back = tokens.back();
 		tokens.resize(TextSeqLength);
 		tokens.back() = back;
 	}
-	int empty_positions = TextSeqLength - static_cast<int>(tokens.size());
-	if (empty_positions > 0)
-		result = torch::cat({ torch::tensor(tokens, torch::kLong), torch::zeros(empty_positions, torch::kLong) });  //position tokens after text
-	return result;
+
+	// После нормализации длина всегда ровно TextSeqLength, поэтому тензор
+	// определён во всех случаях. Раньше при empty_positions == 0 (текст ровно
+	// в 77 токенов, т.е. от ~75 BPE-токенов) возвращался неопределённый Tensor.
+	return torch::tensor(tokens, torch::kLong);
 }
 
 ///
