@@ -16,9 +16,14 @@ public:
 	virtual ~RCLayerNormImpl() {}
 
 	torch::Tensor forward(const torch::Tensor &x) ///!override
-	{ 
-		auto orig_type = x.dtype();
-		auto result = torch::nn::LayerNormImpl::forward(x.to(torch::kFloat32));
+	{
+		// В fp16-модели weight/bias имеют тип half, а layer_norm не допускает
+		// смешанных типов — приводим и вход, и параметры к float32.
+		const auto orig_type = x.dtype();
+		const auto xf = x.to(torch::kFloat32);
+		const auto w = weight.defined() ? weight.to(torch::kFloat32) : weight;
+		const auto b = bias.defined() ? bias.to(torch::kFloat32) : bias;
+		const auto result = torch::layer_norm(xf, options.normalized_shape(), w, b, options.eps());
 		return result.to(orig_type);
 	}
 };

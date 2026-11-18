@@ -139,7 +139,7 @@ RuCLIP.exe --test_ind=0|1 --imgs=<img1,img2,...> --text=<label1,label2,...> ^
 | `--backend` | `torch` (по умолчанию), `trt`, `dnn` |
 | `--preprocess` | `letterbox` (по умолчанию) или `centercrop` |
 | `--max_batch` | верхняя граница batch для optimization profile TensorRT |
-| `--fp16` | TensorRT: построить FP16-engine |
+| `--fp16` | FP16: TensorRT (FP16-engine) и LibTorch (только CUDA); DNN игнорирует |
 | `--repeat` | число измеряемых итераций основной операции (по умолчанию 1); прогрев не учитывается |
 | `--show` | `0` — без окон OpenCV |
 
@@ -188,15 +188,15 @@ PASS
 `--repeat=N` выполняет основную операцию N раз (после одного прогрева) и печатает
 `min/avg/max` по фазам: `preprocess`, `encode_text`, `encode_image`, `postprocess`, `total`.
 
-Сравнить бэкенды (включая FP16 для TensorRT) одним запуском:
+Сравнить бэкенды (включая FP16 для TensorRT и LibTorch) одним запуском:
 
 ```bat
 python tools\run_bench.py --exe ..\rel_all\Release\RuCLIP.exe ^
     --clip ..\CLIP\data\ruclip-vit-large-patch14-336 --repeat 10 ^
-    --backends torch,trt,trt:fp16,dnn
+    --backends torch,trt,trt:fp16,torch:fp16,dnn
 ```
 
-Формат `trt:fp16` означает `--backend=trt --fp16=1`; для `Relevancy` добавьте
+Формат `backend:fp16` означает `--backend=<backend> --fp16=1`; для `Relevancy` добавьте
 `--test-ind 1` (фазы: `reference`, `others`, `text`, `relevancy`).
 
 Пример (large-336, 3 изображения × 3 метки, RTX 4070; `rel_all`):
@@ -204,24 +204,30 @@ python tools\run_bench.py --exe ..\rel_all\Release\RuCLIP.exe ^
 ```
 backend       torch  total, ms       vs torch
 ---------------------------------------------
-torch                   180.14          1.00x
-trt                     104.97          1.72x
-trt_fp16                 34.70          5.19x
-dnn                    1934.95          0.09x
+torch                   181.03          1.00x
+trt                     104.62          1.73x
+trt_fp16                 34.87          5.19x
+torch_fp16               80.51          2.25x
+dnn                    1908.98          0.09x
 
 По фазам, avg ms:
 backend     preprocess   encode_text  encode_image   postprocess         total
-torch             4.24          6.84        169.04          0.02        180.14
-trt               4.47          4.60         95.88          0.03        104.97
-trt_fp16          4.24          4.82         25.62          0.02         34.70
-dnn               4.71         92.11       1838.09          0.04       1934.95
+torch             4.28          7.06        169.66          0.03        181.03
+trt               4.34          4.58         95.67          0.03        104.62
+trt_fp16          4.25          4.78         25.82          0.02         34.87
+torch_fp16        4.26          6.75         69.47          0.03         80.51
+dnn               4.54         91.17       1813.24          0.04       1908.98
 ```
 
-- **FP16 (TensorRT)** — ~5× к torch и ~3× к FP32-движку TensorRT; основной выигрыш в `encode_image`.
-- **Точность FP16**: `max|diff|` вероятностей относительно torch ≈ `2.6e-3` (у FP32-TRT
-  `4.8e-4`, у DNN `5e-6`); паритет-тест использует для FP16 отдельный допуск
-  `--tol-fp16 5e-3` (по умолчанию).
-- `--fp16` поддерживается **только TensorRT**; `torch` и `dnn` его игнорируют.
+- **FP16 поддерживают TensorRT и LibTorch** (только CUDA; на CPU LibTorch FP16 не работает).
+  OpenCV DNN флаг игнорирует.
+- **TensorRT FP16** — ~5.2× к torch и ~3× к FP32-движку TensorRT; **LibTorch FP16** — ~2.25×
+  к FP32 (основной выигрыш в `encode_image`: 69 против 170 мс).
+- **Точность FP16** (`max|diff|` вероятностей относительно torch): LibTorch ≈ `2.7e-4`,
+  TensorRT ≈ `2.6e-3` (у FP32-TRT `4.8e-4`, у DNN `5e-6`). Паритет-тест использует для FP16
+  отдельный допуск `--tol-fp16 5e-3`.
+- Для FP16 в LibTorch `RCLayerNorm` выполняет `LayerNorm` в float32 (веса приводятся к float32),
+  иначе возникает ошибка смешанных типов.
 - Время сборки engine и загрузки моделей/графов в замер не входит (конструктор бэкенда).
   DNN в OpenCV 5.1.0 сейчас CPU-only. Абсолютные числа зависят от модели, GPU и текущей
   загрузки — сравнивайте на своей машине.
@@ -259,7 +265,8 @@ RuCLIP/
   автоматически в `engines/`); по умолчанию TF32 (для строгого FP32 — `clearFlag(kTF32)`).
 - **OpenCV DNN** — требует OpenCV 5.x; новый движок `ENGINE_OPENCV` сейчас CPU-only;
   `opencv_dnn` собран с CUDA, поэтому в PATH нужны cuDNN/ONNX Runtime.
-- **LibTorch** — требует `jit_model.zip`; для base-моделей его надо экспортировать.
+- **LibTorch** — требует `jit_model.zip`; для base-моделей его надо экспортировать. FP16
+  доступен только на CUDA (на CPU LibTorch FP16 не поддерживается).
 - **Препроцессинг**: C++ читает изображения через `cv::imread` в **BGR** и не конвертирует
   в RGB, тогда как Python-референс использует RGB. Это даёт систематическое расхождение с
   Python-вероятностями; исправление — `cv::cvtColor(img, img, cv::COLOR_BGR2RGB)` перед

@@ -15,7 +15,7 @@ namespace
 /// torch::Tensor -> TensorF32 (CPU, contiguous, float32).
 TensorF32 ToTensorF32(const torch::Tensor& t)
 {
-	const torch::Tensor c = t.detach().to(torch::kCPU).contiguous();
+	const torch::Tensor c = t.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
 	TensorF32 out;
 	out.shape.assign(c.sizes().begin(), c.sizes().end());
 	const float* p = c.data_ptr<float>();
@@ -41,12 +41,21 @@ public:
 		clip_->to(device_);
 		clip_->eval();	// инференс, без dropout/BN-статистик
 
+		if (cfg.useFp16)
+		{
+			if (!device_.is_cuda())
+				throw std::runtime_error("TorchBackend: FP16 требует CUDA (на CPU FP16 не поддерживается)");
+			clip_->to(torch::kHalf);
+			dtype_ = torch::kHalf;
+		}
+
 		std::cout << (cuda ? "CUDA is available! Running on GPU."
-		                   : "CUDA is not available! Running on CPU.") << std::endl;
+		                   : "CUDA is not available! Running on CPU.")
+		          << (cfg.useFp16 ? " [FP16]" : "") << std::endl;
 
 		// logit_scale — параметр модели; запоминаем exp(logit_scale) один раз.
 		torch::NoGradGuard no_grad;
-		logitScale_ = clip_->GetLogitScale().exp().item<float>();
+		logitScale_ = clip_->GetLogitScale().to(torch::kFloat32).exp().item<float>();
 	}
 
 	BackendKind kind() const override { return BackendKind::Torch; }
@@ -63,7 +72,7 @@ public:
 			{ images.B, images.C, images.H, images.W },
 			torch::kFloat32).clone();
 
-		return ToTensorF32(clip_->EncodeImage(t.to(device_)));
+		return ToTensorF32(clip_->EncodeImage(t.to(device_).to(dtype_)));
 	}
 
 	TensorF32 EncodeText(const TextBatch& text) override
@@ -83,6 +92,7 @@ public:
 private:
 	CLIP clip_{ nullptr };
 	torch::Device device_{ torch::kCPU };
+	torch::ScalarType dtype_ = torch::kFloat32;
 	float logitScale_ = kDefaultLogitScale;
 };
 
