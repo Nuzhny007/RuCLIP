@@ -19,7 +19,7 @@
 | Бэкенд | Ключ | Артефакт модели | Аппаратное требование |
 |---|---|---|---|
 | LibTorch (текущий) | `torch` | `jit_model.zip` (TorchScript) | CPU / CUDA |
-| TensorRT | `trt` | `clip_visual.engine` + `clip_textual.engine` (из ONNX) | NVIDIA GPU + CUDA + TensorRT |
+| TensorRT | `trt` | `clip_visual.onnx` + `clip_textual.onnx` → кэш `clip_*.{fp32\|fp16}.gpu<N>.b<B>.engine` | NVIDIA GPU + CUDA + TensorRT |
 | OpenCV DNN | `dnn` | `clip_visual.onnx` + `clip_textual.onnx` | CPU (опц. OpenVINO/CUDA-плагин) |
 
 **Не цели (вне рамок):**
@@ -222,10 +222,13 @@ ruclip-vit-<variant>/
 ├── jit_model.zip            # Torch-бэкенд (существующий)
 ├── clip_visual.onnx         # image-encoder (для trt и dnn)
 ├── clip_textual.onnx        # text-encoder, полная последовательность [B,77,D]
-└── engines/                 # (только TensorRT, необязательно, кэш)
-    ├── clip_visual.engine
-    └── clip_textual.engine
+├── clip_visual.<fp32|fp16>.gpu<N>.b<B>.engine   # кэш TensorRT, рядом с ONNX
+└── clip_textual.<fp32|fp16>.gpu<N>.b<B>.engine
 ```
+
+Имя engine включает все параметры, влияющие на содержимое: точность (`fp32`/`fp16`),
+фактический индекс CUDA-устройства (`gpu0`, `gpu1`, …) и `maxBatch` (`b1`, `b8`, …).
+Пример: `clip_textual.fp16.gpu0.b8.engine`.
 
 ### 6.2 Экспорт (одноразовый, Python, офлайн)
 
@@ -270,7 +273,7 @@ ruclip-vit-<variant>/
 **Ключевые решения:**
 - **Формы входа статичны, кроме batch.** Текст `[B,77]`, картинка `[B,3,H,W]`. Для engine задаётся optimization profile по `B` (например, `[1..64]`). Это самый простой сценарий для TRT.
 - **`input_ids` в engine как int32** (надёжнее int64 в TRT), приведение из `TextBatch::ids` тривиально.
-- **Сборка engine**: по умолчанию — при первом запуске из ONNX (кэшируется в `engines/`), альтернатива — офлайн `trtexec`. В конфиге — флаг `useFp16`.
+- **Сборка engine**: при первом запуске из ONNX (кэш рядом с ONNX: `clip_*.{fp32|fp16}.gpu<N>.b<B>.engine`); Python/`trtexec` не нужны. В конфиге — флаг `useFp16` и `maxBatch` (оба входят в имя).
 - **Исполнение**: для простоты — синхронно: `cudaMemcpy(H2D)` → `enqueueV3` → `cudaMemcpy(D2H)`. Выход text-энкодера `[B,77,D]` пропускается через общий `GatherEos`.
 
 **Ограничения (осознанно принимаются):**
@@ -281,8 +284,12 @@ ruclip-vit-<variant>/
 **Реализация (Фаза 3):** `src/Backend/TensorRTBackend.cpp` (~400 строк).
 
 - Окружение машины: **TensorRT 10.16.1.11**, **CUDA 13.2**, драйвер 621, RTX 4070 (sm89), OpenCV 4.14.
-- Движки собираются из ONNX при первом запуске и кэшируются в `<model>/engines/`
-  (`clip_visual.engine` + `clip_textual.engine`; для large-336 ≈ 1.2 ГБ + 0.5 ГБ).
+- Движки собираются из ONNX при первом запуске и кэшируются **рядом с ONNX**:
+  `clip_visual.<fp32|fp16>.gpu<N>.b<B>.engine` и `clip_textual.<fp32|fp16>.gpu<N>.b<B>.engine`
+  (для large-336 fp32 ≈ 1.2 ГБ + 0.5 ГБ). Python/`trtexec` в рантайме не нужны — engine
+  строит сама библиотека через `IBuilder` + ONNX-parser.
+- При последующих запусках engine читается с диска. Если кэш несовместим с текущей
+  версией TensorRT/GPU, он пересобирается и перезаписывается автоматически.
 - CMake: `RUCLIP_WITH_TRT=ON`, `RUCLIP_TRT_ROOT` (автоопределение `C:/work/libraries/cuda/TensorRT-*`), `find_package(CUDAToolkit)`.
 - Особенности TRT 10.16: интерфейсы освобождаются через `delete` (`destroy()` удалён), у `IOptimizationProfile` protected-деструктор (владение забирает `addOptimizationProfile`).
 - Совместимость с torch (cu126): torch ожидает `CUDA::nvToolsExt`, которого нет в CUDA 13 — в CMake добавляется пустая INTERFACE-цель.
@@ -376,7 +383,8 @@ option(RUCLIP_WITH_DNN   "OpenCV DNN backend" OFF)
 > OpenCV DNN, выбор через `--backend=torch|trt|dnn`. ONNX-артефакты (`clip_visual.onnx`,
 > `clip_textual.onnx`) и `logit_scale` в `config.json` получены для трёх моделей скриптом
 > `tools/export_onnx.py` (opset 14, int32-токены, dynamic batch) и проверены `onnxruntime`;
-> TensorRT-engine собираются из ONNX и кэшируются в `engines/`. Паритет бэкендов проверяется
+> TensorRT-engine собираются из ONNX и кэшируются рядом с ONNX (имя включает точность,
+> GPU и maxBatch). Паритет бэкендов проверяется
 > скриптом `tools/run_parity.py` (torch/trt/dnn, порог `2e-3`).
 
 ---
@@ -404,7 +412,7 @@ option(RUCLIP_WITH_DNN   "OpenCV DNN backend" OFF)
 | 1 | OpenCV DNN не покрывает какой-то узел графа (attention/LayerNorm) | блокер фазы 4 | разворачивать LayerNorm; поднять версию OpenCV до 5.0; фолбэк — ONNX Runtime |
 | 2 | `logit_scale` — обучаемый параметр или константа? | точность лоgitов | вынести значение в `config.json` при экспорте; не хардкодить |
 | 3 | fp16 в TRT даёт расхождение эмбеддингов | точность | fp32 по умолчанию; fp16 только за флагом + тест паритета |
-| 4 | Engine TRT привязан к GPU/версии | переносимость | пересборка офлайн/при первом запуске; кэш в `engines/` |
+| 4 | Engine TRT привязан к GPU/версии | переносимость | пересборка при первом запуске/несовместимом кэше; кэш рядом с ONNX, имя включает precision/gpu/batch |
 | 5 | Динамический batch в OpenCV DNN ограничен | удобство | фиксировать batch или пересоздавать сеть |
 | 6 | Нужен ли `DecodeText`/`Predictor` (roadmap 4.4/4.5) для новых бэкендов | объём | вне рамок этого дизайна; при необходимости — общий код, не бэкенд-специфичный |
 | 7 | int64 vs int32 токенов и обратная совместимость Torch-пути | контракт | Torch-бэкенд приводит int32→int64 на входе в `torch::tensor(kLong)` |
@@ -415,7 +423,7 @@ option(RUCLIP_WITH_DNN   "OpenCV DNN backend" OFF)
 
 Реализовано (Фазы 0–5):
 
-- **TensorRT** — `TensorRTBackend`, engine из ONNX (кэш `engines/`), `enqueueV3`, паритет с torch ~5e-4 (TF32).
+- **TensorRT** — `TensorRTBackend`, engine из ONNX (кэш рядом с ONNX, имя `clip_*.{fp32|fp16}.gpu<N>.b<B>.engine`), `enqueueV3`, паритет с torch ~5e-4 (TF32).
 - **OpenCV DNN** — `DnnBackend` на OpenCV 5.1.0 (новый движок `ENGINE_OPENCV`), паритет с torch ~1e-5; обошлось без ручного разворачивания операторов — сказалась подготовка экспорта (opset 14, int32, EOS-`Gather` вне графа).
 - Единый интерфейс `IClipBackend` + общий препроцессинг/постобработка дают и «сборку со всеми бэкендами», и «сборку с одним»; поведение Torch-ветки сохранено (паритет со старым бинарником подтверждён).
 - Добавлены `tools/export_onnx.py`, `tools/run_parity.py`, юнит-тест `ClipMath`, скрипты запуска и README.

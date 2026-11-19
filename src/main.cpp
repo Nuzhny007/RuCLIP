@@ -17,9 +17,9 @@
 
 #include <opencv2/opencv.hpp>
 
-#include "Backend/ClipMath.h"
-#include "Backend/IClipBackend.h"
-#include "RuCLIPProcessor.h"
+#include "ruclip/Backend/ClipMath.h"
+#include "ruclip/Backend/IClipBackend.h"
+#include "ruclip/RuCLIPProcessor.h"
 
 namespace
 {

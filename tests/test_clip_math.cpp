@@ -5,7 +5,7 @@
 //   cmake --build tests/build --config Release
 //   tests/build/Release/test_clip_math.exe
 
-#include "Backend/ClipMath.h"
+#include "ruclip/Backend/ClipMath.h"
 
 #include <cmath>
 #include <cstdio>

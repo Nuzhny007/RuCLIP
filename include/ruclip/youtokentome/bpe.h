@@ -3,9 +3,9 @@
 #include <map>
 #include <string>
 #include <unordered_set>
-#include "third_party/flat_hash_map.h"
+#include "ruclip/youtokentome/third_party/flat_hash_map.h"
 
-#include "utils.h"
+#include "ruclip/youtokentome/utils.h"
 
 namespace vkcom {
 

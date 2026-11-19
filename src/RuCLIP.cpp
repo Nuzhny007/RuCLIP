@@ -1,4 +1,4 @@
-#include "RuCLIP.h"
+#include "ruclip/ClipModel.h"
 
 #include <limits>
 

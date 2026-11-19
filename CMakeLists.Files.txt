@@ -1,82 +1,61 @@
-cmake_minimum_required(VERSION 3.18)
+# Списки исходников и заголовков RuCLIP.
+# Подключается из CMakeLists.txt через include(); не задаёт include-пути
+# и проектные настройки — только наполняет SOURCES/HEADERS.
 
-#project(RuCLIP)
+set(_ruclip_dir "${CMAKE_CURRENT_LIST_DIR}")
 
-include_directories(${CMAKE_SOURCE_DIR}/src)
-include_directories(${CMAKE_SOURCE_DIR}/src/youtokentome)
-include_directories(${CMAKE_SOURCE_DIR}/src/youtokentome/third_party)
-
-# Intel MKL приходит вместе с LibTorch; отдельный link_directories не нужен.
-
-# Бэкенд-нейтральные исходники (Фаза 0/1): не требуют LibTorch.
-set(SOURCES ${SOURCES}
-	src/RuCLIPProcessor.cpp
-	src/Backend/ClipMath.cpp
-	src/Backend/BackendFactory.cpp
-	src/youtokentome/utf8.cpp
-	src/youtokentome/utils.cpp
-	src/youtokentome/bpe.cpp
-	src/main.cpp
+set(SOURCES
+	"${_ruclip_dir}/src/Model.cpp"
+	"${_ruclip_dir}/src/RuCLIPProcessor.cpp"
+	"${_ruclip_dir}/src/Backend/ClipMath.cpp"
+	"${_ruclip_dir}/src/Backend/BackendFactory.cpp"
+	"${_ruclip_dir}/src/youtokentome/utf8.cpp"
+	"${_ruclip_dir}/src/youtokentome/utils.cpp"
+	"${_ruclip_dir}/src/youtokentome/bpe.cpp"
 )
 
-set(HEADERS ${HEADERS}
-	src/Backend/ClipTypes.h
-	src/Backend/ClipMath.h
-	src/Backend/IClipBackend.h
-	src/RuCLIPProcessor.h
-	src/json.hpp
-	src/json_fwd.hpp
-	src/youtokentome/utf8.h
-	src/youtokentome/utils.h
-	src/youtokentome/bpe.h
-	src/TextLower.h
-)
-
-set(LIBS ${LIBS}
-	${OpenCV_LIBS}
+set(HEADERS
+	"${_ruclip_dir}/include/ruclip/ruclip.h"
+	"${_ruclip_dir}/include/ruclip/Model.h"
+	"${_ruclip_dir}/include/ruclip/RuCLIPProcessor.h"
+	"${_ruclip_dir}/include/ruclip/TextLower.h"
+	"${_ruclip_dir}/include/ruclip/json.hpp"
+	"${_ruclip_dir}/include/ruclip/json_fwd.hpp"
+	"${_ruclip_dir}/include/ruclip/Backend/ClipTypes.h"
+	"${_ruclip_dir}/include/ruclip/Backend/ClipMath.h"
+	"${_ruclip_dir}/include/ruclip/Backend/IClipBackend.h"
+	"${_ruclip_dir}/include/ruclip/youtokentome/bpe.h"
+	"${_ruclip_dir}/include/ruclip/youtokentome/utf8.h"
+	"${_ruclip_dir}/include/ruclip/youtokentome/utils.h"
+	"${_ruclip_dir}/include/ruclip/youtokentome/third_party/flat_hash_map.h"
 )
 
 # LibTorch-бэкенд: модель + обёртка.
 if(RUCLIP_WITH_TORCH)
-	set(SOURCES ${SOURCES}
-		src/RuCLIP.cpp
-		src/Backend/TorchBackend.cpp)
+	list(APPEND SOURCES
+		"${_ruclip_dir}/src/RuCLIP.cpp"
+		"${_ruclip_dir}/src/Backend/TorchBackend.cpp")
 
-	set(HEADERS ${HEADERS}
-		src/TorchHeader.h
-		src/RuCLIP.h
-		src/Backend/TorchBackend.h)
-
-	set(LIBS ${LIBS}
-		${TORCH_LIBRARIES})
+	list(APPEND HEADERS
+		"${_ruclip_dir}/include/ruclip/ClipModel.h"
+		"${_ruclip_dir}/include/ruclip/TorchHeader.h"
+		"${_ruclip_dir}/include/ruclip/Backend/TorchBackend.h")
 endif()
 
 # TensorRT-бэкенд: движки из ONNX + CUDA runtime.
 if(RUCLIP_WITH_TRT)
-	set(SOURCES ${SOURCES}
-		src/Backend/TensorRTBackend.cpp)
+	list(APPEND SOURCES
+		"${_ruclip_dir}/src/Backend/TensorRTBackend.cpp")
 
-	set(HEADERS ${HEADERS}
-		src/Backend/TensorRTBackend.h)
-
-	include_directories(${RUCLIP_NVINFER_INCLUDE_DIR})
-	set(LIBS ${LIBS}
-		${RUCLIP_NVINFER_LIB}
-		${RUCLIP_NVONNXPARSER_LIB}
-		CUDA::cudart)
+	list(APPEND HEADERS
+		"${_ruclip_dir}/include/ruclip/Backend/TensorRTBackend.h")
 endif()
 
 # OpenCV DNN-бэкенд (требует OpenCV 5.x).
 if(RUCLIP_WITH_DNN)
-	set(SOURCES ${SOURCES}
-		src/Backend/DnnBackend.cpp)
+	list(APPEND SOURCES
+		"${_ruclip_dir}/src/Backend/DnnBackend.cpp")
 
-	set(HEADERS ${HEADERS}
-		src/Backend/DnnBackend.h)
-endif()
-
-if(MSVC_IDE)
-	source_group("src" FILES ${Files_src})
-
-	source_group("" FILES CMakeLists.Files.txt)
+	list(APPEND HEADERS
+		"${_ruclip_dir}/include/ruclip/Backend/DnnBackend.h")
 endif()

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "Backend/ClipTypes.h"
+#include "ruclip/Backend/ClipTypes.h"
 
-#include "json.hpp"
-#include "bpe.h"
+#include "ruclip/json.hpp"
+#include "ruclip/youtokentome/bpe.h"
 
 #include <opencv2/imgproc/imgproc.hpp>
 

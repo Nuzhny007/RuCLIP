@@ -1,0 +1,39 @@
+@PACKAGE_INIT@
+
+# Пакет ruCLIP: статическая библиотека ruclip::ruclip.
+include(CMakeFindDependencyMacro)
+
+# Значения по умолчанию для машины, на которой собирали пакет. Их можно
+# переопределить снаружи: -DOpenCV_DIR=..., -DTorch_DIR=..., -DCUDAToolkit_ROOT=...
+if(NOT OpenCV_DIR)
+    set(OpenCV_DIR "@OpenCV_DIR@")
+endif()
+if(NOT CUDAToolkit_ROOT)
+    set(CUDAToolkit_ROOT "@CUDAToolkit_ROOT@")
+endif()
+if(@RUCLIP_WITH_TORCH@ AND NOT Torch_DIR)
+    set(Torch_DIR "@Torch_DIR@")
+endif()
+
+if(@RUCLIP_WITH_TORCH@)
+    # LibTorch cu126 ожидает CUDA::nvToolsExt, которой нет в CUDA 13
+    # (NVTX3 заменил nvToolsExt). Та же заглушка, что и при сборке библиотеки.
+    if(NOT TARGET CUDA::nvToolsExt)
+        add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    endif()
+endif()
+
+# OpenCV обязателен: публичные заголовки используют cv::Mat.
+find_dependency(OpenCV COMPONENTS @RUCLIP_LIB_OPENCV_COMPONENTS_SPACED@)
+
+if(@RUCLIP_WITH_TORCH@)
+    find_dependency(Torch)
+endif()
+
+if(@RUCLIP_WITH_TRT@)
+    find_dependency(CUDAToolkit)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/ruCLIPTargets.cmake")
+
+check_required_components(ruCLIP)

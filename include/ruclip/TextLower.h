@@ -4,7 +4,7 @@
 #include <iterator>
 #include <string>
 
-#include "utf8.h"
+#include "ruclip/youtokentome/utf8.h"
 
 /// Понижает регистр UTF-8-строки для диапазонов, которые реально встречаются в
 /// русских подписях: ASCII (A-Z), Latin-1 (À-Þ) и кириллица (А-Я, Ё).

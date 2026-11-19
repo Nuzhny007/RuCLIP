@@ -1,7 +1,7 @@
-#include "Backend/DnnBackend.h"
+#include "ruclip/Backend/DnnBackend.h"
 
-#include "Backend/ClipMath.h"
-#include "json.hpp"
+#include "ruclip/Backend/ClipMath.h"
+#include "ruclip/json.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>

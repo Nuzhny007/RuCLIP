@@ -1,9 +1,9 @@
-#include "utf8.h"
+#include "ruclip/youtokentome/utf8.h"
 #include <cassert>
 #include <iostream>
 #include <string>
 #include <vector>
-#include "utils.h"
+#include "ruclip/youtokentome/utils.h"
 
 namespace vkcom {
 

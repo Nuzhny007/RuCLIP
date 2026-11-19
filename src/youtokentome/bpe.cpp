@@ -1,6 +1,6 @@
 #include <utility>
 
-#include "bpe.h"
+#include "ruclip/youtokentome/bpe.h"
 
 #include <algorithm>
 #include <atomic>
@@ -19,9 +19,9 @@
 #include <utility>
 #include <vector>
 
-#include "third_party/flat_hash_map.h"
-#include "utf8.h"
-#include "utils.h"
+#include "ruclip/youtokentome/third_party/flat_hash_map.h"
+#include "ruclip/youtokentome/utf8.h"
+#include "ruclip/youtokentome/utils.h"
 
 namespace vkcom {
 

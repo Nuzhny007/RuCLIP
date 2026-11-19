@@ -79,12 +79,18 @@ enum class BackendKind
 };
 
 /// Общая конфигурация бэкенда (заполняется в CLI/фабрике).
+///
+/// TensorRT-бэкенд кэширует engine рядом с ONNX:
+///   <model>/clip_visual.<fp32|fp16>.gpu<N>.b<B>.engine
+///   <model>/clip_textual.<fp32|fp16>.gpu<N>.b<B>.engine
+/// N — фактический индекс CUDA-устройства, B — maxBatch. Кэш переиспользуется,
+/// а при несовместимости с текущей версией TensorRT/GPU пересобирается.
 struct BackendConfig
 {
 	std::filesystem::path modelDir;	///< каталог модели (config.json, bpe.model, ...)
-	int deviceIndex = 0;			///< индекс CUDA-устройства (TensorRT)
-	int maxBatch = 8;			///< TensorRT: верхняя граница batch в optimization profile
-	bool useFp16 = false;			///< TensorRT: построить FP16-engine
+	int deviceIndex = 0;			///< индекс CUDA-устройства (TensorRT); входит в имя engine (gpu<N>)
+	int maxBatch = 8;			///< TensorRT: верхняя граница batch в optimization profile; входит в имя engine (b<B>)
+	bool useFp16 = false;			///< TensorRT: построить FP16-engine; входит в имя engine (fp32/fp16)
 	bool verbose = false;
 };
 

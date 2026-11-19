@@ -28,7 +28,7 @@ RuCLIP.exe --backend=torch|trt|dnn ...
 | 0 | Нейтральный слой `src/Backend/`: `TensorF32`, `TextBatch`, `ImageBatch`, `ClipMath` (`Logits`/`Relevancy`/`GatherEos`) |
 | 1 | `IClipBackend` + `TorchBackend`, ключ `--backend`, CMake-опции `RUCLIP_WITH_*` |
 | 2 | Экспорт ONNX (`tools/export_onnx.py`) + `logit_scale` в `config.json` для трёх моделей |
-| 3 | `TensorRTBackend` (engine из ONNX, кэш в `<model>/engines/`) |
+| 3 | `TensorRTBackend` (engine из ONNX, кэш рядом с ONNX: `clip_*.{fp32\|fp16}.gpu<N>.b<B>.engine`) |
 | 4 | `DnnBackend` (OpenCV 5.x, новый graph-движок `ENGINE_OPENCV`) |
 | 5 | Паритет-тест `tools/run_parity.py`, скрипты запуска, этот README |
 
@@ -71,7 +71,7 @@ RuCLIP.exe --backend=torch|trt|dnn ...
 **Torch-only:**
 ```bat
 cmake -S RuCLIP -B rel -G "Visual Studio 17 2022" -A x64 -DRUCLIP_WITH_TORCH=ON
-cmake --build rel --config Release --target RuCLIP
+cmake --build rel --config Release
 ```
 
 **TensorRT-only** (пути — пример для этой машины):
@@ -106,6 +106,58 @@ cmake --build rel_all --config Release
 > `-DTorch_DIR=...`. `RUCLIP_TRT_ROOT` при необходимости определяется автоматически из
 > `C:/work/libraries/cuda/TensorRT-*` или переменной окружения `TENSORRT_ROOT`.
 
+## Использование как библиотеки (CMake)
+
+Проект собирается в **статическую библиотеку** `ruclip` (CMake-цель `ruclip::ruclip`) и
+опциональную CLI-утилиту `RuCLIP` (`-DRUCLIP_BUILD_CLI=OFF` — только библиотека).
+Библиотека экспортирует CMake-пакет `ruCLIP`: стороннему приложению достаточно
+`find_package(ruCLIP)` и одной цели.
+
+```bat
+cmake -S RuCLIP -B build_lib -G "Visual Studio 17 2022" -A x64 ^
+  -DRUCLIP_WITH_TORCH=ON -DRUCLIP_BUILD_CLI=OFF ^
+  -DCMAKE_INSTALL_PREFIX=C:/work/clip/ruclip-install ^
+  "-DTorch_DIR=C:/work/libraries/torch/libtorch-win-shared-with-deps-latest+cu126/libtorch/share/cmake/Torch" ^
+  "-DOpenCV_DIR=C:/work/libraries/opencv/5.0/build_cuda/install/x64/vc17/lib"
+cmake --build build_lib --config Release
+cmake --install build_lib --config Release
+```
+
+Установка раскладывает:
+
+```
+<prefix>/lib/ruclip.lib
+<prefix>/include/ruclip/...                # публичные заголовки
+<prefix>/lib/cmake/ruCLIP/ruCLIPConfig.cmake
+<prefix>/lib/cmake/ruCLIP/ruCLIPConfigVersion.cmake
+<prefix>/lib/cmake/ruCLIP/ruCLIPTargets.cmake
+```
+
+Подключение в стороннем проекте:
+
+```cmake
+find_package(ruCLIP CONFIG REQUIRED)          # или -DruCLIP_DIR=<prefix>/lib/cmake/ruCLIP
+target_link_libraries(app PRIVATE ruclip::ruclip)
+```
+
+Публичный API — `#include <ruclip/ruclip.h>`; высокоуровневый фасад `ruclip::Model`:
+
+```cpp
+#include <ruclip/ruclip.h>
+
+ruclip::ModelOptions opt;
+opt.modelDir = "C:/models/ruclip-vit-large-patch14-336";
+opt.backend  = ruclip::BackendKind::TensorRT;   // Torch | TensorRT | Dnn
+opt.useFp16  = true;
+
+ruclip::Model model(opt);
+ruclip::TensorF32 probs = model.ProbsPerImage({image}, {"кот", "медведь", "лиса"});
+```
+
+Конфиг-пакет сам вызывает `find_dependency` для OpenCV (обязательно), а также Torch и
+CUDAToolkit — если библиотека собрана с этими бэкендами. Готовый пример-потребитель:
+[`examples/basic`](examples/basic/README.md).
+
 ## Экспорт ONNX
 
 Скрипт `tools/export_onnx.py` экспортирует из **оригинальной Python-модели** `ruclip`
@@ -124,6 +176,35 @@ python tools/export_onnx.py --models ruclip-vit-large-patch14-336
 Требуется Python + PyTorch + onnx (для проверки — onnxruntime). Особенности: opset 14,
 dynamic batch, разложенные `LayerNorm`/`QuickGELU`. `logit_scale` **обучаемый и разный по
 моделям** (31.40 / 45.29 / 48.74), поэтому читается из `config.json`, а не хардкодится.
+
+## TensorRT: генерация engine и кэш
+
+Python и `trtexec` для инференса **не нужны**: engine собирает сама библиотека
+(`nvinfer1::IBuilder` + ONNX-parser) при первом запуске.
+
+Перед сборкой проверяется наличие файла рядом с ONNX:
+
+```
+<model>/clip_visual.<precision>.gpu<N>.b<B>.engine
+<model>/clip_textual.<precision>.gpu<N>.b<B>.engine
+```
+
+- `<precision>` — `fp32` или `fp16` (флаг `--fp16`);
+- `gpu<N>` — фактический индекс CUDA-устройства (`BackendConfig::deviceIndex`);
+- `b<B>` — `maxBatch` optimization profile (флаг `--max_batch`).
+
+Примеры: `clip_textual.fp16.gpu0.b8.engine`, `clip_visual.fp32.gpu1.b1.engine`.
+
+Поведение:
+
+1. файла нет → engine собирается из ONNX и сохраняется рядом с ONNX;
+2. файл есть → engine читается с диска (сборки нет);
+3. файл есть, но не десериализуется (другая версия TensorRT/GPU) → пересобирается
+   и перезаписывается.
+
+Все параметры, влияющие на содержимое engine, входят в имя, поэтому разные
+конфигурации не перетирают кэш друг друга. Каталог `<model>/engines/`, который
+использовали прежние версии, больше не читается и не создаётся.
 
 ## Запуск
 
@@ -237,21 +318,33 @@ dnn               4.54         91.17       1813.24          0.04       1908.98
 
 ```
 RuCLIP/
-├── CMakeLists.txt              # опции бэкендов, поиск Torch/TensorRT/OpenCV
+├── CMakeLists.txt              # библиотека ruclip + CLI, install/export пакета ruCLIP
 ├── CMakeLists.Files.txt        # условные списки исходников
-├── src/
+├── cmake/
+│   └── ruCLIPConfig.cmake.in   # шаблон find_package(ruCLIP)
+├── include/ruclip/             # ПУБЛИЧНЫЕ заголовки
+│   ├── ruclip.h                # umbrella-заголовок
+│   ├── Model.h                 # фасад ruclip::Model
+│   ├── RuCLIPProcessor.h       # токенизация + препроцессинг
 │   ├── Backend/
 │   │   ├── ClipTypes.h         # TensorF32 / TextBatch / ImageBatch / BackendConfig
-│   │   ├── ClipMath.*          # Logits / ProbsPerImage / Relevancy / GatherEos
+│   │   ├── ClipMath.h          # Logits / ProbsPerImage / Relevancy / GatherEos
 │   │   ├── IClipBackend.h      # интерфейс + CreateBackend
-│   │   ├── TorchBackend.*
-│   │   ├── TensorRTBackend.*
-│   │   ├── DnnBackend.*
-│   │   └── BackendFactory.cpp
-│   ├── RuCLIP.*                # LibTorch-модель (CLIPImpl)
-│   ├── RuCLIPProcessor.*       # токенизация + препроцессинг (нейтральные буферы)
-│   ├── main.cpp                # CLI
+│   │   ├── TorchBackend.h
+│   │   ├── TensorRTBackend.h
+│   │   └── DnnBackend.h
+│   ├── ClipModel.h             # LibTorch-модель (CLIPImpl, внутренний)
+│   ├── TextLower.h
+│   ├── json*.hpp               # vendored nlohmann/json
 │   └── youtokentome/           # vendored BPE
+├── src/
+│   ├── Model.cpp               # реализация фасада
+│   ├── RuCLIP.cpp              # LibTorch-модель
+│   ├── RuCLIPProcessor.cpp
+│   ├── main.cpp                # CLI
+│   ├── Backend/                # *.cpp бэкендов + BackendFactory
+│   └── youtokentome/           # *.cpp BPE
+├── examples/basic/             # приложение-потребитель find_package(ruCLIP)
 ├── tools/
 │   ├── export_onnx.py          # экспорт clip_visual/clip_textual + logit_scale
 │   ├── run_parity.py           # паритет-тест бэкендов
@@ -263,7 +356,8 @@ RuCLIP/
 ## Известные ограничения и расхождения
 
 - **TensorRT** — только NVIDIA GPU; engine привязан к GPU/версии TensorRT (пересобирается
-  автоматически в `engines/`); по умолчанию TF32 (для строгого FP32 — `clearFlag(kTF32)`).
+  автоматически рядом с ONNX; имя включает точность, GPU и maxBatch); по умолчанию TF32
+  (для строгого FP32 — `clearFlag(kTF32)`).
 - **OpenCV DNN** — требует OpenCV 5.x; новый движок `ENGINE_OPENCV` сейчас CPU-only;
   `opencv_dnn` собран с CUDA, поэтому в PATH нужны cuDNN/ONNX Runtime.
 - **LibTorch** — требует `jit_model.zip`; для base-моделей его надо экспортировать. FP16

@@ -1,15 +1,15 @@
-#include "Backend/IClipBackend.h"
+#include "ruclip/Backend/IClipBackend.h"
 
 #include <stdexcept>
 
 #ifdef RUCLIP_HAS_TORCH
-#include "Backend/TorchBackend.h"
+#include "ruclip/Backend/TorchBackend.h"
 #endif
 #ifdef RUCLIP_HAS_TRT
-#include "Backend/TensorRTBackend.h"
+#include "ruclip/Backend/TensorRTBackend.h"
 #endif
 #ifdef RUCLIP_HAS_DNN
-#include "Backend/DnnBackend.h"
+#include "ruclip/Backend/DnnBackend.h"
 #endif
 
 namespace ruclip

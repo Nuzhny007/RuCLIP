@@ -11,4 +11,4 @@ add_executable(test_clip_math
 	../src/Backend/ClipMath.cpp
 	test_clip_math.cpp)
 
-target_include_directories(test_clip_math PRIVATE ../src)
+target_include_directories(test_clip_math PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)

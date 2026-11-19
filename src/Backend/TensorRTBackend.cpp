@@ -1,7 +1,7 @@
-#include "Backend/TensorRTBackend.h"
+#include "ruclip/Backend/TensorRTBackend.h"
 
-#include "Backend/ClipMath.h"
-#include "json.hpp"
+#include "ruclip/Backend/ClipMath.h"
+#include "ruclip/json.hpp"
 
 // Порядок важен: cuda_runtime.h даёт cudaStream_t / cudaError_t для NvInfer.h.
 #include <cuda_runtime.h>
@@ -109,6 +109,17 @@ void WriteFile(const std::string& path, const void* data, size_t size)
 	f.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
 }
 
+/// Имя файла кэша engine: <stem>.<fp32|fp16>.gpu<N>.b<maxBatch>.engine.
+/// Все параметры, влияющие на содержимое engine, входят в имя, поэтому файлы
+/// разных конфигураций не перетирают друг друга:
+///   clip_visual.fp16.gpu0.b8.engine, clip_textual.fp32.gpu1.b1.engine, ...
+std::string EngineFileName(const char* stem, bool fp16, int deviceIndex, int maxBatch)
+{
+	return std::string(stem) + (fp16 ? ".fp16" : ".fp32") +
+	       ".gpu" + std::to_string(deviceIndex) +
+	       ".b" + std::to_string(maxBatch) + ".engine";
+}
+
 /// Один движок (engine) TensorRT: сериализация/десериализация, контекст, буферы.
 class TrtEngine
 {
@@ -126,26 +137,36 @@ public:
 		: inputName_(inputName), outputName_(outputName)
 	{
 		std::vector<char> serialized;
+		bool fromDisk = false;
 		if (std::filesystem::exists(enginePath))
 		{
 			serialized = ReadFile(enginePath);
+			fromDisk = true;
 			if (verbose)
 				std::fprintf(stderr, "[TensorRT] loaded engine %s (%zu bytes)\n", enginePath.c_str(), serialized.size());
-		}
-		else
-		{
-			serialized = BuildEngine(onnxPath, inputName, minDims, optDims, maxDims, fp16, logger);
-			WriteFile(enginePath, serialized.data(), serialized.size());
-			if (verbose)
-				std::fprintf(stderr, "[TensorRT] built engine %s (%zu bytes)\n", enginePath.c_str(), serialized.size());
 		}
 
 		runtime_.reset(nvinfer1::createInferRuntime(logger));
 		if (!runtime_)
 			throw std::runtime_error("TensorRT: createInferRuntime failed");
-		engine_.reset(runtime_->deserializeCudaEngine(serialized.data(), serialized.size()));
+
+		if (fromDisk)
+			engine_.reset(runtime_->deserializeCudaEngine(serialized.data(), serialized.size()));
+
 		if (!engine_)
-			throw std::runtime_error("TensorRT: failed to deserialize engine " + enginePath);
+		{
+			// Кэша нет или он несовместим с текущей версией TensorRT / GPU:
+			// собираем engine из ONNX и сохраняем рядом с ONNX.
+			if (fromDisk && verbose)
+				std::fprintf(stderr, "[TensorRT] cached engine is stale, rebuilding %s\n", enginePath.c_str());
+			serialized = BuildEngine(onnxPath, inputName, minDims, optDims, maxDims, fp16, logger);
+			WriteFile(enginePath, serialized.data(), serialized.size());
+			if (verbose)
+				std::fprintf(stderr, "[TensorRT] built engine %s (%zu bytes)\n", enginePath.c_str(), serialized.size());
+			engine_.reset(runtime_->deserializeCudaEngine(serialized.data(), serialized.size()));
+			if (!engine_)
+				throw std::runtime_error("TensorRT: failed to deserialize freshly built engine " + enginePath);
+		}
 		context_.reset(engine_->createExecutionContext());
 		if (!context_)
 			throw std::runtime_error("TensorRT: createExecutionContext failed");
@@ -311,12 +332,8 @@ public:
 		const int dev = std::min(std::max(0, cfg.deviceIndex), deviceCount - 1);
 		CudaCheck(cudaSetDevice(dev), "cudaSetDevice");
 
-		const std::filesystem::path enginesDir = cfg.modelDir / "engines";
-		std::filesystem::create_directories(enginesDir);
-
-		// Разные файлы кэша для FP32 и FP16, иначе --fp16 подхватил бы FP32-engine.
-		const std::string precisionSuffix = cfg.useFp16 ? ".fp16" : "";
-
+		// Кэш engine лежит рядом с ONNX. Имя содержит точность, фактический
+		// индекс GPU и maxBatch: все они влияют на содержимое engine.
 		const std::string visualOnnx = (cfg.modelDir / "clip_visual.onnx").string();
 		const std::string textualOnnx = (cfg.modelDir / "clip_textual.onnx").string();
 		if (!std::filesystem::exists(visualOnnx))
@@ -325,7 +342,7 @@ public:
 			throw std::runtime_error("TensorRT: missing ONNX model " + textualOnnx);
 
 		visual_ = std::make_unique<TrtEngine>(
-			(enginesDir / ("clip_visual" + precisionSuffix + ".engine")).string(), visualOnnx,
+			(cfg.modelDir / EngineFileName("clip_visual", cfg.useFp16, dev, maxBatch)).string(), visualOnnx,
 			"pixel_values", "image_features",
 			MakeDims({ 1, 3, imageSize_, imageSize_ }),
 			MakeDims({ 1, 3, imageSize_, imageSize_ }),
@@ -333,7 +350,7 @@ public:
 			cfg.useFp16, logger_, cfg.verbose);
 
 		textual_ = std::make_unique<TrtEngine>(
-			(enginesDir / ("clip_textual" + precisionSuffix + ".engine")).string(), textualOnnx,
+			(cfg.modelDir / EngineFileName("clip_textual", cfg.useFp16, dev, maxBatch)).string(), textualOnnx,
 			"input_ids", "text_features",
 			MakeDims({ 1, contextLength_ }),
 			MakeDims({ 1, contextLength_ }),

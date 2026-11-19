@@ -1,12 +1,12 @@
 #pragma once
 
-#include "json.hpp"
+#include "ruclip/json.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 
-#include "TorchHeader.h"
+#include "ruclip/TorchHeader.h"
 
 ///to handle fp16
 class RCLayerNormImpl : public torch::nn::LayerNormImpl {

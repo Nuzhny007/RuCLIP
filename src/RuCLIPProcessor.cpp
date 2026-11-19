@@ -1,5 +1,5 @@
-#include "RuCLIPProcessor.h"
-#include "TextLower.h"
+#include "ruclip/RuCLIPProcessor.h"
+#include "ruclip/TextLower.h"
 
 #include <algorithm>
 #include <cstddef>

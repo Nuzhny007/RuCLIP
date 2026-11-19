@@ -1,7 +1,7 @@
-#include "Backend/TorchBackend.h"
+#include "ruclip/Backend/TorchBackend.h"
 
-#include "Backend/ClipMath.h"
-#include "RuCLIP.h"
+#include "ruclip/Backend/ClipMath.h"
+#include "ruclip/ClipModel.h"
 
 #include <iostream>
 #include <stdexcept>
